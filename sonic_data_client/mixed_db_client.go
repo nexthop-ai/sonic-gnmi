@@ -1363,19 +1363,23 @@ func (c *MixedDbClient) SetFullConfig(delete []*gnmipb.Path, replace []*gnmipb.U
 		return fmt.Errorf("Value encoding is not IETF JSON")
 	}
 	content := []byte(ietf_json_val)
+
+	// still needed...?
 	fileName := c.workPath + "/config_db.json.tmp"
 	err := ioutil.WriteFile(fileName, content, 0644)
 	if err != nil {
 		return err
 	}
 
-	PyCodeInGo := fmt.Sprintf(PyCodeForYang, fileName)
-	err = RunPyCode(PyCodeInGo)
+	var sc ssc.Service
+	sc, err = ssc.NewDbusClient()
 	if err != nil {
-		return fmt.Errorf("Yang validation failed!")
+		return err
 	}
 
-	return nil
+	err = sc.ConfigReplace(string(content))
+
+	return err
 }
 
 func (c *MixedDbClient) SetDB(delete []*gnmipb.Path, replace []*gnmipb.Update, update []*gnmipb.Update) error {
