@@ -798,11 +798,9 @@ func authenticate(config *Config, ctx context.Context, target string, writeAcces
 
 	// Skip authentication for UDS (Unix Domain Socket) connections.
 	// UDS security is enforced at the file-system level via socket permissions.
-	if pr, ok := peer.FromContext(ctx); ok && pr.Addr != nil {
-		if _, isUnix := pr.Addr.(*net.UnixAddr); isUnix {
-			rc.Auth.AuthEnabled = false
-			return ctx, nil
-		}
+	if isUnixPeer(ctx) {
+		rc.Auth.AuthEnabled = false
+		return ctx, nil
 	}
 
 	if !config.UserAuth.Any() {
@@ -873,6 +871,35 @@ func authenticate(config *Config, ctx context.Context, target string, writeAcces
 	log.V(5).Infof("authenticate user %v, roles %v", rc.Auth.User, rc.Auth.Roles)
 
 	return ctx, nil
+}
+
+func isUnixPeer(ctx context.Context) bool {
+	pr, ok := peer.FromContext(ctx)
+	if !ok || pr.Addr == nil {
+		return false
+	}
+	_, ok = pr.Addr.(*net.UnixAddr)
+	return ok
+}
+
+func containsBGPRunningConfigPath(prefix *gnmipb.Path, paths []*gnmipb.Path) bool {
+	if prefix == nil || prefix.GetTarget() != "SHOW" {
+		return false
+	}
+	for _, path := range paths {
+		// Match the Elem precedence used by the SHOW client router. Deprecated
+		// Element fields do not override an Elem path.
+		elems := append([]*gnmipb.PathElem{}, prefix.GetElem()...)
+		elems = append(elems, path.GetElem()...)
+		names := make([]string, 0, len(elems))
+		for _, elem := range elems {
+			names = append(names, elem.GetName())
+		}
+		if len(names) == 2 && names[0] == "bgp" && names[1] == "running-config" {
+			return true
+		}
+	}
+	return false
 }
 
 // Subscribe implements the gNMI Subscribe RPC.
@@ -1020,7 +1047,7 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 		dc, err = sdc.NewShowClient(paths, prefix)
 		authTarget = "gnmi_show"
 	} else if targetDbName, ok, _, _ := sdc.IsTargetDb(target); ok {
-		dc, err = sdc.NewDbClient(paths, prefix)
+		dc, err = sdc.NewDbClientForGet(paths, prefix)
 		if err == nil {
 			// For Get requests, validate that all requested keys exist in Redis.
 			// NewDbClient allows non-existent paths (needed for Subscribe to monitor
@@ -1057,6 +1084,10 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
 		return nil, err
+	}
+	if containsBGPRunningConfigPath(prefix, paths) && !isUnixPeer(ctx) {
+		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
+		return nil, status.Error(codes.PermissionDenied, "BGP running configuration is available only over the Unix domain socket")
 	}
 	// Checked after authenticate so unauthenticated callers get
 	// Unauthenticated instead of a policy result.
