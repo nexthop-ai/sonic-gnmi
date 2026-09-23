@@ -636,6 +636,7 @@ func TestGnsiAuthzRotation(t *testing.T) {
 			defer conn.Close()
 			sc := authz.NewAuthzClient(conn)
 			tc.f(ctx, t, sc, s)
+			waitForAuthzRotateIdle(t)
 			if err := resetAuthzPolicyFile(s.config); err != nil {
 				t.Errorf("Error when reverting to V1: %v", err)
 			}
@@ -890,6 +891,38 @@ func expectPolicyMatch(t *testing.T, path, src string) {
 func generateCreatedOn() uint64 {
 	return uint64(time.Now().UnixNano())
 }
+
+// waitForAuthzRotateIdle blocks until no server-side authz.Rotate handler holds
+// authzMu. A subtest that drops its connection mid-RPC returns before the server
+// notices, reverts the policy file and unlocks; requiring the lock to stay free
+// for a short window also covers a handler that has not yet been dispatched.
+func waitForAuthzRotateIdle(t *testing.T) {
+	t.Helper()
+	const (
+		poll    = 10 * time.Millisecond
+		settle  = 100 * time.Millisecond
+		timeout = 5 * time.Second
+	)
+	deadline := time.Now().Add(timeout)
+	var idleSince time.Time
+	for {
+		if authzMu.TryLock() {
+			authzMu.Unlock()
+			if idleSince.IsZero() {
+				idleSince = time.Now()
+			} else if time.Since(idleSince) >= settle {
+				return
+			}
+		} else {
+			idleSince = time.Time{}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for in-flight authz.Rotate handler to finish")
+		}
+		time.Sleep(poll)
+	}
+}
+
 func resetAuthzPolicyFile(config *Config) error {
 	return attemptWrite(config.AuthzPolicyFile, []byte(authzTestPolicyFileV1), 0600)
 }
