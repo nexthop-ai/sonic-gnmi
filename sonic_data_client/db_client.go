@@ -1588,8 +1588,8 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 		// Subscribe to keyspace notification
 		pattern := "__keyspace@" + strconv.Itoa(int(spb.Target_value[tblPath.dbName])) + "__:"
 		pattern += tblPath.tableName
-		if tblPath.dbName == "COUNTERS_DB" && !countersDbHasTableKeys(tblPath.tableName) {
-			// tables in COUNTERS_DB without per-object keys, skip delimitor
+		if tblPath.tableKey == "" && tblPath.dbName == "COUNTERS_DB" && !countersDbHasTableKeys(tblPath.tableName) {
+			// whole-table path: a table outside countersDbHasTableKeys is matched as one hash named after the table
 		} else {
 			pattern += tblPath.delimitor
 		}
