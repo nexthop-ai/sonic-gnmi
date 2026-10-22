@@ -1841,6 +1841,127 @@ func TestTableData2Msi_SkipsEmptyData(t *testing.T) {
 	})
 }
 
+func TestTableData2Msi_CountersDbWholeTable(t *testing.T) {
+	mapkey := ":"
+	cleanup := setupMixedDbRedis(t, mapkey)
+	defer cleanup()
+	ns := ""
+
+	rclient := Target2RedisDb[ns]["COUNTERS_DB"]
+	// the whole-table reads below see every row, including any left by another package's tests
+	rclient.FlushDB(context.Background())
+	rclient.HSet(context.Background(), "RATES:oid:0x1000000000056", "RX_BPS", "10")
+	rclient.HSet(context.Background(), "RATES:oid:0x1000000000057", "RX_BPS", "20")
+	rclient.HSet(context.Background(), "COUNTERS_PORT_NAME_MAP", "Ethernet0", "oid:0x1000000000056")
+	rclient.HSet(context.Background(), "BOTH_LAYOUTS", "oid:0x1000000000056", "from-hash")
+	rclient.HSet(context.Background(), "BOTH_LAYOUTS:oid:0x1000000000056", "RX_BPS", "30")
+	rclient.HSet(context.Background(), "BOTH_LAYOUTS:oid:0x1000000000057", "RX_BPS", "40")
+
+	mixed := MixedDbClient{mapkey: mapkey, encoding: gnmipb.Encoding_JSON_IETF}
+	rates := map[string]interface{}{
+		"oid:0x1000000000056": map[string]interface{}{"RX_BPS": "10"},
+		"oid:0x1000000000057": map[string]interface{}{"RX_BPS": "20"},
+	}
+	tests := []struct {
+		table   string
+		want    map[string]interface{}
+		wantErr bool
+	}{{
+		table: "RATES",
+		want:  rates,
+	}, {
+		table: "COUNTERS_PORT_NAME_MAP",
+		want:  map[string]interface{}{"Ethernet0": "oid:0x1000000000056"},
+	}, {
+		// a hash named after the table hides the rows under it
+		table: "BOTH_LAYOUTS",
+		want:  map[string]interface{}{"oid:0x1000000000056": "from-hash"},
+	}, {
+		table: "RATES*",
+		want:  rates,
+	}, {
+		// matches COUNTERS_PORT_NAME_MAP, which has no table key to split off
+		table:   "*",
+		wantErr: true,
+	}}
+	for _, tt := range tests {
+		tblPath := tablePath{dbNamespace: ns, dbName: "COUNTERS_DB", tableName: tt.table, delimitor: ":"}
+		check := func(t *testing.T, msi map[string]interface{}, err error) {
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("got %v, want an error", msi)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("error = %v", err)
+			}
+			if !reflect.DeepEqual(msi, tt.want) {
+				t.Errorf("got %v, want %v", msi, tt.want)
+			}
+		}
+		t.Run("DbClient_"+tt.table, func(t *testing.T) {
+			msi := make(map[string]interface{})
+			err := TableData2Msi(&tblPath, false, nil, &msi)
+			check(t, msi, err)
+		})
+		t.Run("MixedDbClient_"+tt.table, func(t *testing.T) {
+			msi := make(map[string]interface{})
+			err := mixed.tableData2Msi(&tblPath, false, nil, &msi)
+			check(t, msi, err)
+		})
+	}
+}
+
+func TestRedisSubDataKeyFromChannel(t *testing.T) {
+	ratesPrefix := "__keyspace@2__:RATES"
+	wholeRates := redisSubData{
+		tblPath:     tablePath{dbName: "COUNTERS_DB", tableName: "RATES", delimitor: ":"},
+		prefixLen:   len(ratesPrefix),
+		matchesHash: true,
+	}
+	globRates := redisSubData{
+		tblPath:     tablePath{dbName: "COUNTERS_DB", tableName: "RATES*", delimitor: ":"},
+		prefixLen:   len("__keyspace@2__:RATES*"),
+		matchesHash: true,
+	}
+	globRate := redisSubData{
+		tblPath:     tablePath{dbName: "COUNTERS_DB", tableName: "RATE*", delimitor: ":"},
+		prefixLen:   len("__keyspace@2__:RATE*"),
+		matchesHash: true,
+	}
+	wholeCounters := redisSubData{
+		tblPath:   tablePath{dbName: "COUNTERS_DB", tableName: "COUNTERS", delimitor: ":"},
+		prefixLen: len("__keyspace@2__:COUNTERS:"),
+	}
+	tests := []struct {
+		desc      string
+		rsd       redisSubData
+		channel   string
+		wantTable string
+		wantKey   string
+		wantOk    bool
+	}{
+		{"row under a table that may be one hash", wholeRates, ratesPrefix + ":oid:0x1000000000056", "RATES", "oid:0x1000000000056", true},
+		{"hash named after the table", wholeRates, ratesPrefix, "RATES", "", true},
+		{"table whose name starts with the subscribed table's name", wholeRates, ratesPrefix + "_OTHER:oid:0x1000000000056", "", "", false},
+		{"glob table name", globRates, ratesPrefix + ":oid:0x1000000000056", "RATES", "oid:0x1000000000056", true},
+		{"glob table name shorter than the table", globRate, ratesPrefix + ":oid:0x1000000000056", "RATES", "oid:0x1000000000056", true},
+		{"glob table name matching another table", globRates, ratesPrefix + "_OTHER:oid:0x1000000000056", "RATES_OTHER", "oid:0x1000000000056", true},
+		{"glob table name matching a hash with no table key", globRates, ratesPrefix + "_MAP", "", "", false},
+		{"row under a keyed table", wholeCounters, "__keyspace@2__:COUNTERS:oid:0x1000000000056", "COUNTERS", "oid:0x1000000000056", true},
+		{"channel shorter than the pattern prefix", wholeCounters, "__keyspace@2__:COUNT", "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			table, key, ok := tt.rsd.keyFromChannel(tt.channel)
+			if table != tt.wantTable || key != tt.wantKey || ok != tt.wantOk {
+				t.Errorf("keyFromChannel(%q) = %q, %q, %v, want %q, %q, %v", tt.channel, table, key, ok, tt.wantTable, tt.wantKey, tt.wantOk)
+			}
+		})
+	}
+}
+
 func TestTableData2TypedValue_ConfigDBWildcardPreservesTables(t *testing.T) {
 	cleanup := setupTestTarget2RedisDb(t)
 	defer cleanup()

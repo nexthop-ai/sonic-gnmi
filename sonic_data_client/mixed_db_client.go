@@ -814,15 +814,33 @@ func (c *MixedDbClient) getDbtablePath(path *gnmipb.Path, value *gnmipb.TypedVal
 	tblPath.tableName = ""
 	if len(stringSlice) > 1 {
 		tblPath.tableName = stringSlice[1]
-		// tables in COUNTERS_DB other than COUNTERS/PORT_PHY_ATTR don't have keys
-		// Insert a dummy table key
+		// In a COUNTERS_DB table not known to be keyed, the next element names a row,
+		// which may not exist yet, unless no such row exists and the hash named after
+		// the table has that field. Insert an empty table key for a field.
 		if tblPath.dbName == "COUNTERS_DB" && !countersDbHasTableKeys(tblPath.tableName) {
-			if len(stringSlice) == 2 {
-				stringSlice = append(stringSlice, "")
-			} else {
-				index := 2
-				stringSlice = append(stringSlice[:index+1], stringSlice[index:]...)
-				stringSlice[index] = ""
+			isRow := false
+			if redisDb, ok := RedisDbMap[c.mapkey+":"+tblPath.dbName]; ok && len(stringSlice) > 2 {
+				n, err := redisDb.Exists(context.Background(), tblPath.tableName+separator+stringSlice[2]).Result()
+				if err != nil {
+					return nil, fmt.Errorf("redis Exists op failed for %v: %v", dbPath, err)
+				}
+				isRow = n == 1
+				if !isRow {
+					isField, err := redisDb.HExists(context.Background(), tblPath.tableName, stringSlice[2]).Result()
+					if err != nil {
+						return nil, fmt.Errorf("redis HExists op failed for %v: %v", dbPath, err)
+					}
+					isRow = !isField
+				}
+			}
+			if !isRow {
+				if len(stringSlice) == 2 {
+					stringSlice = append(stringSlice, "")
+				} else {
+					index := 2
+					stringSlice = append(stringSlice[:index+1], stringSlice[index:]...)
+					stringSlice[index] = ""
+				}
 			}
 		}
 	}
@@ -992,16 +1010,9 @@ func (c *MixedDbClient) tableData2Msi(tblPath *tablePath, useKey bool, op *strin
 		}
 	} else if tblPath.tableKey == "" {
 		// Only table name provided
-		// tables in COUNTERS_DB other than COUNTERS/PORT_PHY_ATTR don't have keys
-		if tblPath.dbName == "COUNTERS_DB" && !countersDbHasTableKeys(tblPath.tableName) {
-			pattern = tblPath.tableName
-		} else {
-			pattern = tblPath.tableName + tblPath.delimitor + "*"
-		}
-		dbkeys, err = redisDb.Keys(context.Background(), pattern).Result()
+		dbkeys, err = wholeTableKeys(redisDb, tblPath)
 		if err != nil {
-			log.V(2).Infof("redis Keys failed for %v, pattern %s", tblPath, pattern)
-			return fmt.Errorf("redis Keys failed for %v, pattern %s %v", tblPath, pattern, err)
+			return err
 		}
 	} else {
 		// both table name and key provided
@@ -1051,6 +1062,9 @@ func (c *MixedDbClient) tableData2Msi(tblPath *tablePath, useKey bool, op *strin
 			var key string
 			// Split dbkey string into two parts and second part is key in table
 			keys := strings.SplitN(dbkey, tblPath.delimitor, 2)
+			if len(keys) < 2 {
+				return fmt.Errorf("dbkey: %s, failed split from delimiter %v", dbkey, tblPath.delimitor)
+			}
 			key = keys[1]
 			err = c.makeJSON_redis(msi, &key, op, fv)
 			if err != nil {
@@ -1226,7 +1240,7 @@ func (c *MixedDbClient) handleTableData(tblPaths []tablePath) error {
 		if tblPath.operation == opRemove {
 			//Only table name provided
 			if tblPath.tableKey == "" {
-				// tables in COUNTERS_DB other than COUNTERS/PORT_PHY_ATTR don't have keys
+				// a COUNTERS_DB table not known to be keyed is removed as one hash
 				if tblPath.dbName == "COUNTERS_DB" && !countersDbHasTableKeys(tblPath.tableName) {
 					pattern = tblPath.tableName
 				} else {
@@ -2127,7 +2141,6 @@ func (c *MixedDbClient) dbFieldSubscribe(gnmiPath *gnmipb.Path, onChange bool, i
 func (c *MixedDbClient) dbSingleTableKeySubscribe(rsd redisSubData, updateChannel chan map[string]interface{}) {
 	tblPath := rsd.tblPath
 	pubsub := rsd.pubsub
-	prefixLen := rsd.prefixLen
 	msi := make(map[string]interface{})
 
 	log.V(2).Infof("Starting dbSingleTableKeySubscribe routine for %+v", tblPath)
@@ -2160,11 +2173,10 @@ func (c *MixedDbClient) dbSingleTableKeySubscribe(rsd redisSubData, updateChanne
 				} else {
 					fp := map[string]interface{}{}
 					//fp["DEL"] = ""
-					if len(subscr.Channel) < prefixLen {
-						log.V(2).Infof("Invalid psubscribe channel notification %v, shorter than %v", subscr.Channel, prefixLen)
+					_, key, ok := rsd.keyFromChannel(subscr.Channel)
+					if !ok {
 						continue
 					}
-					key := subscr.Channel[prefixLen:]
 					newMsi[key] = fp
 					newMsi["delete"] = "null_value"
 				}
@@ -2178,11 +2190,11 @@ func (c *MixedDbClient) dbSingleTableKeySubscribe(rsd redisSubData, updateChanne
 					}
 				} else {
 					tblPath := tblPath
-					if len(subscr.Channel) < prefixLen {
-						log.V(2).Infof("Invalid psubscribe channel notification %v, shorter than %v", subscr.Channel, prefixLen)
+					table, key, ok := rsd.keyFromChannel(subscr.Channel)
+					if !ok {
 						continue
 					}
-					tblPath.tableKey = subscr.Channel[prefixLen:]
+					tblPath.tableName, tblPath.tableKey = table, key
 					err = c.tableData2Msi(&tblPath, true, nil, &newMsi)
 					if err != nil {
 						putFatalMsg(c.q, err.Error())
@@ -2275,9 +2287,8 @@ func (c *MixedDbClient) dbTableKeySubscribe(gnmiPath *gnmipb.Path, interval time
 		// Subscribe to keyspace notification
 		pattern := "__keyspace@" + strconv.Itoa(int(spb.Target_value[tblPath.dbName])) + "__:"
 		pattern += tblPath.tableName
-		if tblPath.dbName == "COUNTERS_DB" && !countersDbHasTableKeys(tblPath.tableName) {
-			// tables in COUNTERS_DB without per-object keys, skip delimitor
-		} else {
+		matchesHash := wholeTableMatchesHash(&tblPath)
+		if !matchesHash {
 			pattern += tblPath.delimitor
 		}
 
@@ -2315,9 +2326,10 @@ func (c *MixedDbClient) dbTableKeySubscribe(gnmiPath *gnmipb.Path, interval time
 			return
 		}
 		rsd := redisSubData{
-			tblPath:   tblPath,
-			pubsub:    pubsub,
-			prefixLen: prefixLen,
+			tblPath:     tblPath,
+			pubsub:      pubsub,
+			prefixLen:   prefixLen,
+			matchesHash: matchesHash,
 		}
 		rsdList = append(rsdList, rsd)
 	}

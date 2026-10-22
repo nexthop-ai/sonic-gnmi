@@ -1799,6 +1799,22 @@ func createCountersDbQueryOnChangeMode(t *testing.T, paths ...string) client.Que
 		false)
 }
 
+// createSonicDbQueryOnChangeMode creates a query with ON_CHANGE mode and origin sonic-db.
+func createSonicDbQueryOnChangeMode(t *testing.T, paths ...string) client.Query {
+	q := createQueryOrFail(t,
+		pb.SubscriptionList_STREAM,
+		"",
+		[]subscriptionQuery{
+			{
+				Query:   paths,
+				SubMode: pb.SubscriptionMode_ON_CHANGE,
+			},
+		},
+		false)
+	q.SubReq.GetSubscribe().Prefix.Origin = "sonic-db"
+	return q
+}
+
 // createRatesTableSetUpdate creates a HSET request on the RATES table.
 func createRatesTableSetUpdate(tableKey string, fieldName string, fieldValue string) tablePathValue {
 	return tablePathValue{
@@ -2286,6 +2302,24 @@ func runGnmiTestGet(t *testing.T, namespace string) {
 		t.Fatalf("failed to open %s, err: %v", fileName, err)
 	}
 
+	fileName = "../testdata/PERIODIC_WATERMARKS_expected.json"
+	periodicWatermarksTableByte, err := os.ReadFile(fileName)
+	if err != nil {
+		t.Fatalf("failed to open %s, err: %v", fileName, err)
+	}
+
+	fileName = "../testdata/RATES_expected.json"
+	ratesTableByte, err := os.ReadFile(fileName)
+	if err != nil {
+		t.Fatalf("failed to open %s, err: %v", fileName, err)
+	}
+
+	fileName = "../testdata/RATES:oid:Ethernet89.txt"
+	ratesRowByte, err := os.ReadFile(fileName)
+	if err != nil {
+		t.Fatalf("failed to open %s, err: %v", fileName, err)
+	}
+
 	stateDBPath := "STATE_DB"
 
 	ns, _ := sdcfg.GetDbDefaultNamespace()
@@ -2620,6 +2654,40 @@ func runGnmiTestGet(t *testing.T, namespace string) {
 			wantRespVal: phyAttrSingleEntryByte,
 			valTest:     true,
 		}, {
+			desc:       "get whole PERIODIC_WATERMARKS table",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
+					elem: <name: "PERIODIC_WATERMARKS" >
+				`,
+			wantRetCode: codes.OK,
+			wantRespVal: periodicWatermarksTableByte,
+			valTest:     true,
+		}, {
+			desc:       "get whole RATES table",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
+					elem: <name: "RATES" >
+				`,
+			wantRetCode: codes.OK,
+			wantRespVal: ratesTableByte,
+			valTest:     true,
+		}, {
+			desc:       "get RATES rows by glob table name",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
+					elem: <name: "RATES*" >
+				`,
+			wantRetCode: codes.OK,
+			wantRespVal: ratesTableByte,
+			valTest:     true,
+		}, {
+			desc:       "get glob table name matching a hash with no table key",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
+					elem: <name: "*" >
+				`,
+			wantRetCode: codes.NotFound,
+		}, {
 			desc:       "get COUNTERS:fcbb:bbbb:2::/48 -- malformed",
 			pathTarget: "COUNTERS_DB",
 			textPbPath: `
@@ -2664,6 +2732,79 @@ func runGnmiTestGet(t *testing.T, namespace string) {
 			`{"build_version": "SONiC.23456789.01", "error":""}`,
 			"build_version: '23456789.01'\ndebian_version: '9.15'",
 			nil),
+	}
+
+	// MixedDbClient connects through the Redis unix socket, which this setup provides only for the default namespace
+	if namespace == ns {
+		tds = append(tds, []testCase{{
+			desc: "get whole PERIODIC_WATERMARKS table with origin sonic-db",
+			textPbPath: `
+					origin: "sonic-db"
+					elem: <name: "COUNTERS_DB" > elem: <name: "localhost" > elem: <name: "PERIODIC_WATERMARKS" >
+				`,
+			wantRetCode: codes.OK,
+			wantRespVal: periodicWatermarksTableByte,
+			valTest:     true,
+		}, {
+			desc: "get RATES row with origin sonic-db",
+			textPbPath: `
+					origin: "sonic-db"
+					elem: <name: "COUNTERS_DB" > elem: <name: "localhost" > elem: <name: "RATES" > elem: <name: "oid:0x1000000000056" >
+				`,
+			wantRetCode: codes.OK,
+			wantRespVal: ratesRowByte,
+			valTest:     true,
+		}, {
+			desc: "get RATES row field with origin sonic-db",
+			textPbPath: `
+					origin: "sonic-db"
+					elem: <name: "COUNTERS_DB" > elem: <name: "localhost" > elem: <name: "RATES" > elem: <name: "oid:0x1000000000056" >
+					elem: <name: "SAI_PORT_STAT_IF_IN_NON_UCAST_PKTS_last" >
+				`,
+			wantRetCode: codes.OK,
+			wantRespVal: `"15952"`,
+			valTest:     true,
+		}, {
+			desc: "get COUNTERS_PORT_NAME_MAP field with origin sonic-db",
+			textPbPath: `
+					origin: "sonic-db"
+					elem: <name: "COUNTERS_DB" > elem: <name: "localhost" > elem: <name: "COUNTERS_PORT_NAME_MAP" > elem: <name: "Ethernet68" >
+				`,
+			wantRetCode: codes.OK,
+			wantRespVal: `"oid:0x1000000000039"`,
+			valTest:     true,
+		}, {
+			desc: "get missing RATES row with origin sonic-db",
+			textPbPath: `
+					origin: "sonic-db"
+					elem: <name: "COUNTERS_DB" > elem: <name: "localhost" > elem: <name: "RATES" > elem: <name: "oid:0x10000000000ff" >
+				`,
+			wantRetCode: codes.NotFound,
+		}, {
+			desc: "get field of missing RATES row with origin sonic-db",
+			textPbPath: `
+					origin: "sonic-db"
+					elem: <name: "COUNTERS_DB" > elem: <name: "localhost" > elem: <name: "RATES" > elem: <name: "oid:0x10000000000ff" >
+					elem: <name: "FEC_PRE_BER" >
+				`,
+			wantRetCode: codes.NotFound,
+		}, {
+			desc: "get RATES rows by glob table name with origin sonic-db",
+			textPbPath: `
+					origin: "sonic-db"
+					elem: <name: "COUNTERS_DB" > elem: <name: "localhost" > elem: <name: "RATES*" >
+				`,
+			wantRetCode: codes.OK,
+			wantRespVal: ratesTableByte,
+			valTest:     true,
+		}, {
+			desc: "get glob table name matching a hash with no table key with origin sonic-db",
+			textPbPath: `
+					origin: "sonic-db"
+					elem: <name: "COUNTERS_DB" > elem: <name: "localhost" > elem: <name: "*" >
+				`,
+			wantRetCode: codes.NotFound,
+		}}...)
 	}
 
 	for _, td := range tds {
@@ -3224,6 +3365,30 @@ func runTestSubscribe(t *testing.T, namespace string) {
 		"SAI_INGRESS_PRIORITY_GROUP_STAT_XOFF_ROOM_WATERMARK_BYTES": "10",  // Changed from 0 to 10
 	}
 	pgWatermarksEthernet16JsonUpdate["Ethernet16:5"] = eth16_5
+
+	fileName = "../testdata/PERIODIC_WATERMARKS_expected.json"
+	periodicWatermarksTableByte, err := ioutil.ReadFile(fileName)
+	if err != nil {
+		t.Fatalf("read file %v err: %v", fileName, err)
+	}
+	var periodicWatermarksTableJson interface{}
+	json.Unmarshal(periodicWatermarksTableByte, &periodicWatermarksTableJson)
+
+	fileName = "../testdata/RATES_expected.json"
+	ratesTableByte, err := ioutil.ReadFile(fileName)
+	if err != nil {
+		t.Fatalf("read file %v err: %v", fileName, err)
+	}
+	var ratesTableJson interface{}
+	json.Unmarshal(ratesTableByte, &ratesTableJson)
+	ratesRowJson := ratesTableJson.(map[string]interface{})["oid:0x1000000000056"]
+	ratesRowUpdate := mergeStrMaps(ratesRowJson, map[string]interface{}{"FEC_PRE_BER": "5"})
+	ratesTableUpdate := map[string]interface{}{"oid:0x1000000000056": ratesRowUpdate}
+	periodicWatermarksQueueUpdate := map[string]interface{}{
+		"oid:0x1500000000091c": map[string]interface{}{
+			"SAI_QUEUE_STAT_SHARED_WATERMARK_BYTES": "32",
+		},
+	}
 
 	// Alias translation for query PERIODIC_WATERMARKS:Ethernet16/1:PriorityGroups
 	fileName = "../testdata/PERIODIC_WATERMARKS:Ethernet16:PriorityGroups_alias_expected.txt"
@@ -4058,6 +4223,76 @@ func runTestSubscribe(t *testing.T, namespace string) {
 			},
 		},
 		{
+<<<<<<< HEAD
+=======
+			desc:              "sample stream query for COUNTERS/Ethernet68/Queues with PERIODIC_WATERMARKS field value change",
+			q:                 createCountersDbQuerySampleMode(t, 0, false, "COUNTERS", "Ethernet68", "Queues"),
+			generateIntervals: true,
+			updates: []tablePathValue{
+				createPeriodicWatermarksTableSetUpdate("oid:0x1500000000091c", "SAI_QUEUE_STAT_SHARED_WATERMARK_BYTES", "32"), // being changed from 192 to 32
+			},
+			wantNoti: []client.Notification{
+				client.Connected{},
+				client.Update{Path: []string{"COUNTERS_DB", "COUNTERS", "Ethernet68", "Queues"}, TS: time.Unix(0, 200), Val: countersEthernet68QueuesJson},
+				client.Sync{},
+				client.Update{Path: []string{"COUNTERS_DB", "COUNTERS", "Ethernet68", "Queues"}, TS: time.Unix(0, 200), Val: mergeStrMaps(countersEthernet68QueuesJson, map[string]interface{}{"Ethernet68:1:periodic": eth68_1_periodic})},
+			},
+		},
+		{
+			desc: "stream query for COUNTERS/Ethernet68/Queues with PERIODIC_WATERMARKS field value change",
+			q:    createCountersDbQueryOnChangeMode(t, "COUNTERS", "Ethernet68", "Queues"),
+			updates: []tablePathValue{
+				createPeriodicWatermarksTableSetUpdate("oid:0x1500000000091c", "SAI_QUEUE_STAT_SHARED_WATERMARK_BYTES", "32"), // being changed from 192 to 32
+			},
+			wantNoti: []client.Notification{
+				client.Connected{},
+				client.Update{Path: []string{"COUNTERS_DB", "COUNTERS", "Ethernet68", "Queues"}, TS: time.Unix(0, 200), Val: countersEthernet68QueuesJson},
+				client.Sync{},
+				client.Update{Path: []string{"COUNTERS_DB", "COUNTERS", "Ethernet68", "Queues"}, TS: time.Unix(0, 200), Val: map[string]interface{}{"Ethernet68:1:periodic": eth68_1_periodic}},
+			},
+		},
+		{
+			desc:              "sample stream query for table PERIODIC_WATERMARKS with field value change",
+			q:                 createCountersDbQuerySampleMode(t, 0, false, "PERIODIC_WATERMARKS"),
+			generateIntervals: true,
+			updates: []tablePathValue{
+				createPeriodicWatermarksTableSetUpdate("oid:0x1500000000091c", "SAI_QUEUE_STAT_SHARED_WATERMARK_BYTES", "32"), // being changed from 192 to 32
+			},
+			wantNoti: []client.Notification{
+				client.Connected{},
+				client.Update{Path: []string{"COUNTERS_DB", "PERIODIC_WATERMARKS"}, TS: time.Unix(0, 200), Val: periodicWatermarksTableJson},
+				client.Sync{},
+				client.Update{Path: []string{"COUNTERS_DB", "PERIODIC_WATERMARKS"}, TS: time.Unix(0, 200), Val: mergeStrMaps(periodicWatermarksTableJson, periodicWatermarksQueueUpdate)},
+			},
+		},
+		{
+			desc: "stream query for table PERIODIC_WATERMARKS with field value change",
+			q:    createCountersDbQueryOnChangeMode(t, "PERIODIC_WATERMARKS"),
+			updates: []tablePathValue{
+				createPeriodicWatermarksTableSetUpdate("oid:0x1500000000091c", "SAI_QUEUE_STAT_SHARED_WATERMARK_BYTES", "32"), // being changed from 192 to 32
+			},
+			wantNoti: []client.Notification{
+				client.Connected{},
+				client.Update{Path: []string{"COUNTERS_DB", "PERIODIC_WATERMARKS"}, TS: time.Unix(0, 200), Val: periodicWatermarksTableJson},
+				client.Sync{},
+				client.Update{Path: []string{"COUNTERS_DB", "PERIODIC_WATERMARKS"}, TS: time.Unix(0, 200), Val: periodicWatermarksQueueUpdate},
+			},
+		},
+		{
+			desc: "stream query for RATES rows by glob table name with field value change",
+			q:    createCountersDbQueryOnChangeMode(t, "RATES*"),
+			updates: []tablePathValue{
+				createRatesTableSetUpdate("oid:0x1000000000056", "FEC_PRE_BER", "5"), // being changed from 0 to 5
+			},
+			wantNoti: []client.Notification{
+				client.Connected{},
+				client.Update{Path: []string{"COUNTERS_DB", "RATES*"}, TS: time.Unix(0, 200), Val: ratesTableJson},
+				client.Sync{},
+				client.Update{Path: []string{"COUNTERS_DB", "RATES*"}, TS: time.Unix(0, 200), Val: ratesTableUpdate},
+			},
+		},
+		{
+>>>>>>> 97c6044 (NOS-19610: Read keyed rows for whole-table COUNTERS_DB paths (#321))
 			desc: "poll query for COUNTERS/Ethernet7/Queues with field value change (no PERIODIC_WATERMARKS table)",
 			poll: 1,
 			q: client.Query{
@@ -4539,12 +4774,64 @@ func runTestSubscribe(t *testing.T, namespace string) {
 		},
 	}
 
+	// MixedDbClient connects through the Redis unix socket, which this setup provides only for the default namespace
+	if ns, _ := sdcfg.GetDbDefaultNamespace(); namespace == ns {
+		tests = append(tests, TestExec{
+			desc: "stream query with origin sonic-db for table PERIODIC_WATERMARKS with field value change",
+			q:    createSonicDbQueryOnChangeMode(t, "COUNTERS_DB", "localhost", "PERIODIC_WATERMARKS"),
+			updates: []tablePathValue{
+				createPeriodicWatermarksTableSetUpdate("oid:0x1500000000091c", "SAI_QUEUE_STAT_SHARED_WATERMARK_BYTES", "32"), // being changed from 192 to 32
+			},
+			wantNoti: []client.Notification{
+				client.Connected{},
+				client.Update{Path: []string{"sonic-db", "COUNTERS_DB", "localhost", "PERIODIC_WATERMARKS"}, TS: time.Unix(0, 200), Val: periodicWatermarksTableJson},
+				client.Sync{},
+				client.Update{Path: []string{"sonic-db", "COUNTERS_DB", "localhost", "PERIODIC_WATERMARKS"}, TS: time.Unix(0, 200), Val: periodicWatermarksQueueUpdate},
+			},
+		}, TestExec{
+			desc: "stream query with origin sonic-db for RATES rows by glob table name with field value change",
+			q:    createSonicDbQueryOnChangeMode(t, "COUNTERS_DB", "localhost", "RATES*"),
+			updates: []tablePathValue{
+				createRatesTableSetUpdate("oid:0x1000000000056", "FEC_PRE_BER", "5"), // being changed from 0 to 5
+			},
+			wantNoti: []client.Notification{
+				client.Connected{},
+				client.Update{Path: []string{"sonic-db", "COUNTERS_DB", "localhost", "RATES*"}, TS: time.Unix(0, 200), Val: ratesTableJson},
+				client.Sync{},
+				client.Update{Path: []string{"sonic-db", "COUNTERS_DB", "localhost", "RATES*"}, TS: time.Unix(0, 200), Val: ratesTableUpdate},
+			},
+		}, TestExec{
+			desc: "stream query with origin sonic-db for a RATES row with field value change",
+			q:    createSonicDbQueryOnChangeMode(t, "COUNTERS_DB", "localhost", "RATES", "oid:0x1000000000056"),
+			updates: []tablePathValue{
+				createRatesTableSetUpdate("oid:0x1000000000056", "FEC_PRE_BER", "5"), // being changed from 0 to 5
+			},
+			wantNoti: []client.Notification{
+				client.Connected{},
+				client.Update{Path: []string{"sonic-db", "COUNTERS_DB", "localhost", "RATES", "oid:0x1000000000056"}, TS: time.Unix(0, 200), Val: ratesRowJson},
+				client.Sync{},
+				client.Update{Path: []string{"sonic-db", "COUNTERS_DB", "localhost", "RATES", "oid:0x1000000000056"}, TS: time.Unix(0, 200), Val: ratesRowUpdate},
+			},
+		}, TestExec{
+			desc: "stream query with origin sonic-db for a RATES row created after the subscription",
+			q:    createSonicDbQueryOnChangeMode(t, "COUNTERS_DB", "localhost", "RATES", "oid:0x10000000000ff"),
+			updates: []tablePathValue{
+				createRatesTableSetUpdate("oid:0x10000000000ff", "FEC_PRE_BER", "5"),
+			},
+			wantNoti: []client.Notification{
+				client.Connected{},
+				client.Update{Path: []string{"sonic-db", "COUNTERS_DB", "localhost", "RATES", "oid:0x10000000000ff"}, TS: time.Unix(0, 200), Val: map[string]interface{}{}},
+				client.Sync{},
+				client.Update{Path: []string{"sonic-db", "COUNTERS_DB", "localhost", "RATES", "oid:0x10000000000ff"}, TS: time.Unix(0, 200), Val: map[string]interface{}{"FEC_PRE_BER": "5"}},
+			},
+		})
+	}
+
 	sdc.NeedMock = true
 	rclient := getRedisClient(t, namespace)
 	defer rclient.Close()
 	var wg sync.WaitGroup
 	for _, tt := range tests {
-		wg.Add(1)
 		prepareDb(t, namespace)
 		// Extra db preparation for this test case
 		for _, prepare := range tt.prepares {
@@ -4583,6 +4870,7 @@ func runTestSubscribe(t *testing.T, namespace string) {
 				mutexGotNoti.Unlock()
 				return nil
 			}
+			wg.Add(1)
 			go func(t2 TestExec) {
 				defer wg.Done()
 				err := c.Subscribe(context.Background(), q)

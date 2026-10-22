@@ -541,11 +541,48 @@ func ValToResp(val Value) (*gnmipb.SubscribeResponse, error) {
 	}
 }
 
-// countersDbHasTableKeys returns true if the given COUNTERS_DB table stores
-// data under per-object keys (e.g. COUNTERS, PORT_PHY_ATTR).  Tables that are
-// stored as a single hash without sub-keys return false.
+// countersDbHasTableKeys returns true for a COUNTERS_DB table known to store
+// its data in per-object rows (COUNTERS:oid:...). False means the layout is not
+// known: the table may be one hash (COUNTERS_PORT_NAME_MAP) or rows.
 func countersDbHasTableKeys(tableName string) bool {
 	return tableName == "COUNTERS" || tableName == "PORT_PHY_ATTR"
+}
+
+// wholeTableMatchesHash reports whether a whole-table path also matches the hash
+// named after the table.
+func wholeTableMatchesHash(tblPath *tablePath) bool {
+	return tblPath.tableKey == "" && tblPath.dbName == "COUNTERS_DB" && !countersDbHasTableKeys(tblPath.tableName)
+}
+
+// wholeTableIsGlob reports whether wholeTableMatchesHash holds for a table named
+// with a Redis glob. A glob is matched against whole key names, not read as both layouts.
+func wholeTableIsGlob(tblPath *tablePath) bool {
+	return wholeTableMatchesHash(tblPath) && strings.ContainsAny(tblPath.tableName, "*?[")
+}
+
+// wholeTableKeys returns the Redis keys under a whole-table path: for a path that
+// also matches the table's hash, the hash when it exists and its rows otherwise.
+func wholeTableKeys(redisDb *redis.Client, tblPath *tablePath) ([]string, error) {
+	glob := wholeTableIsGlob(tblPath)
+	if wholeTableMatchesHash(tblPath) && !glob {
+		n, err := redisDb.Exists(context.Background(), tblPath.tableName).Result()
+		if err != nil {
+			return nil, fmt.Errorf("redis Exists failed for %v: %v", tblPath.tableName, err)
+		}
+		if n == 1 {
+			return []string{tblPath.tableName}, nil
+		}
+	}
+	pattern := tblPath.tableName + tblPath.delimitor + "*"
+	if glob {
+		pattern = tblPath.tableName
+	}
+	dbkeys, err := redisDb.Keys(context.Background(), pattern).Result()
+	if err != nil {
+		log.V(2).Infof("redis Keys failed for %v, pattern %s", tblPath, pattern)
+		return nil, fmt.Errorf("redis Keys failed for %v, pattern %s %v", tblPath, pattern, err)
+	}
+	return dbkeys, nil
 }
 
 func GetTableKeySeparator(target string, ns string) (string, error) {
@@ -1010,23 +1047,15 @@ func emitJSON(v *map[string]interface{}) ([]byte, error) {
 func TableData2Msi(tblPath *tablePath, useKey bool, op *string, msi *map[string]interface{}) error {
 	redisDb := Target2RedisDb[tblPath.dbNamespace][tblPath.dbName]
 
-	var pattern string
 	var dbkeys []string
 	var err error
 	var fv map[string]string
 
 	//Only table name provided
 	if tblPath.tableKey == "" {
-		// tables in COUNTERS_DB other than COUNTERS/PORT_PHY_ATTR don't have keys
-		if tblPath.dbName == "COUNTERS_DB" && !countersDbHasTableKeys(tblPath.tableName) {
-			pattern = tblPath.tableName
-		} else {
-			pattern = tblPath.tableName + tblPath.delimitor + "*"
-		}
-		dbkeys, err = redisDb.Keys(context.Background(), pattern).Result()
+		dbkeys, err = wholeTableKeys(redisDb, tblPath)
 		if err != nil {
-			log.V(2).Infof("redis Keys failed for %v, pattern %s", tblPath, pattern)
-			return fmt.Errorf("redis Keys failed for %v, pattern %s %v", tblPath, pattern, err)
+			return err
 		}
 	} else {
 		// both table name and key provided
@@ -1448,13 +1477,41 @@ type redisSubData struct {
 	tblPath   tablePath
 	pubsub    *redis.PubSub
 	prefixLen int
+	// the pattern ends at the table name, so it matches the table's hash and its rows
+	matchesHash bool
+}
+
+// keyFromChannel returns the table and table key a keyspace notification is for,
+// or false for a channel that is not under the subscribed table.
+func (rsd *redisSubData) keyFromChannel(channel string) (string, string, bool) {
+	if wholeTableIsGlob(&rsd.tblPath) {
+		// a glob matches whole key names, so the table and key come from the key itself
+		_, dbkey, _ := strings.Cut(channel, ":")
+		table, key, found := strings.Cut(dbkey, rsd.tblPath.delimitor)
+		if !found {
+			return "", "", false
+		}
+		return table, key, true
+	}
+	if len(channel) < rsd.prefixLen {
+		log.V(2).Infof("Invalid psubscribe channel notification %v, shorter than %v", channel, rsd.prefixLen)
+		return "", "", false
+	}
+	key := channel[rsd.prefixLen:]
+	if !rsd.matchesHash || key == "" {
+		return rsd.tblPath.tableName, key, true
+	}
+	// a table whose name starts with the subscribed table's name also matches the pattern
+	if !strings.HasPrefix(key, rsd.tblPath.delimitor) {
+		return "", "", false
+	}
+	return rsd.tblPath.tableName, key[len(rsd.tblPath.delimitor):], true
 }
 
 // TODO: For delete operation, the exact content returned is to be clarified.
 func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan map[string]interface{}) {
 	tblPath := rsd.tblPath
 	pubsub := rsd.pubsub
-	prefixLen := rsd.prefixLen
 	msi := make(map[string]interface{})
 
 	log.V(2).Infof("Starting dbSingleTableKeySubscribe routine for %+v", tblPath)
@@ -1487,11 +1544,10 @@ func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan
 				} else {
 					fp := map[string]interface{}{}
 					//fp["DEL"] = ""
-					if len(subscr.Channel) < prefixLen {
-						log.V(2).Infof("Invalid psubscribe channel notification %v, shorter than %v", subscr.Channel, prefixLen)
+					_, key, ok := rsd.keyFromChannel(subscr.Channel)
+					if !ok {
 						continue
 					}
-					key := subscr.Channel[prefixLen:]
 					newMsi[key] = fp
 				}
 			} else if subscr.Payload == "hset" {
@@ -1504,11 +1560,11 @@ func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan
 					}
 				} else {
 					tblPath := tblPath
-					if len(subscr.Channel) < prefixLen {
-						log.V(2).Infof("Invalid psubscribe channel notification %v, shorter than %v", subscr.Channel, prefixLen)
+					table, key, ok := rsd.keyFromChannel(subscr.Channel)
+					if !ok {
 						continue
 					}
-					tblPath.tableKey = subscr.Channel[prefixLen:]
+					tblPath.tableName, tblPath.tableKey = table, key
 					err = TableData2Msi(&tblPath, true, nil, &newMsi)
 					if err != nil {
 						enqueueFatalMsg(c, err.Error())
@@ -1588,9 +1644,14 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 		// Subscribe to keyspace notification
 		pattern := "__keyspace@" + strconv.Itoa(int(spb.Target_value[tblPath.dbName])) + "__:"
 		pattern += tblPath.tableName
+<<<<<<< HEAD
 		if tblPath.dbName == "COUNTERS_DB" && !countersDbHasTableKeys(tblPath.tableName) {
 			// tables in COUNTERS_DB without per-object keys, skip delimitor
 		} else {
+=======
+		matchesHash := wholeTableMatchesHash(&tblPath)
+		if !matchesHash {
+>>>>>>> 97c6044 (NOS-19610: Read keyed rows for whole-table COUNTERS_DB paths (#321))
 			pattern += tblPath.delimitor
 		}
 
@@ -1624,9 +1685,10 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 			return
 		}
 		rsd := redisSubData{
-			tblPath:   tblPath,
-			pubsub:    pubsub,
-			prefixLen: prefixLen,
+			tblPath:     tblPath,
+			pubsub:      pubsub,
+			prefixLen:   prefixLen,
+			matchesHash: matchesHash,
 		}
 		rsdList = append(rsdList, rsd)
 	}
