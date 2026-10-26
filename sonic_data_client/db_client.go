@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/sonic-net/sonic-gnmi/common_utils"
 	"net"
 	"reflect"
 	"strconv"
@@ -588,28 +589,20 @@ func GetRedisClientsForDb(target string) (redis_client_map map[string]*redis.Cli
 // returns: 1. DbName (string) 2. Is DbName valid (bool)
 //  3. DbNamespace (string) 4. Is DbNamespace present in Target (bool)
 func IsTargetDb(target string) (string, bool, string, bool) {
-	targetname := strings.Split(target, "/")
-	dbName := targetname[0]
-	dbNameSpaceExist := false
+	dbName, ns, ok := common_utils.SplitDbTarget(target)
 	dbNamespace, _ := sdcfg.GetDbDefaultNamespace()
+	if !ok {
+		log.V(1).Infof("target %q is not a database target", target)
+		return dbName, false, dbNamespace, false
+	}
+	// ASIC Suffix is only used in case if device is multi-asic/namespace.
+	// A target with a slash selects the namespace it carries, even an
+	// empty one (COUNTERS_DB/), which parsePath then refuses for V2R paths.
 	isMultiNamespace, _ := sdcfg.CheckDbMultiNamespace()
-
-	if len(targetname) > 2 {
-		log.V(1).Infof("target format is not correct")
-		return dbName, false, dbNamespace, dbNameSpaceExist
+	if isMultiNamespace && strings.Contains(target, "/") {
+		return dbName, true, ns, true
 	}
-	// ASIC Suffix is only used in case if device is multi-asic/namespace
-	if isMultiNamespace && len(targetname) > 1 {
-		dbNamespace = targetname[1]
-		dbNameSpaceExist = true
-	}
-	for name, _ := range spb.Target_value {
-		if name == dbName {
-			return dbName, true, dbNamespace, dbNameSpaceExist
-		}
-	}
-
-	return dbName, false, dbNamespace, dbNameSpaceExist
+	return dbName, true, dbNamespace, false
 }
 
 // For testing only

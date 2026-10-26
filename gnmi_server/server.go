@@ -1067,7 +1067,7 @@ func ParseOrigin(paths []*gnmipb.Path) (string, error) {
 }
 
 func IsNativeOrigin(origin string) bool {
-	return origin == "sonic-db"
+	return common_utils.IsNativeOrigin(origin)
 }
 
 func nativeSetTarget(prefix *gnmipb.Path, paths []*gnmipb.Path) string {

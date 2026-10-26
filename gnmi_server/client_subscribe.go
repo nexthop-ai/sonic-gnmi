@@ -5,6 +5,11 @@ import (
 	"github.com/Workiva/go-datastructures/queue"
 	log "github.com/golang/glog"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
+<<<<<<< HEAD
+=======
+	"github.com/sonic-net/sonic-gnmi/common_utils"
+	spb "github.com/sonic-net/sonic-gnmi/proto"
+>>>>>>> 39a97ae (NOS-8352: [common_utils] gNMI path helpers: ElemsString, RenderPath, IsYANGTarget (#334))
 	sdc "github.com/sonic-net/sonic-gnmi/sonic_data_client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -197,33 +202,38 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 	log.V(3).Infof("mode=%v, origin=%q, target=%q", mode, origin, target)
 
 	authTarget := "gnmi"
-	if origin == "openconfig" {
+	// common_utils.ResolveBackend selects the backend; each arm builds its client.
+	backend := common_utils.ResolveBackend(origin, target, mode == gnmipb.SubscriptionList_STREAM)
+	switch backend {
+	case common_utils.BackendYANG:
 		dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions, sdc.TranslWildcardOption{})
-	} else if IsNativeOrigin(origin) {
+	case common_utils.BackendNativeDB:
 		var targetDbName string
 		dc, err = sdc.NewMixedDbClient(paths, prefix, origin, gnmipb.Encoding_JSON_IETF, "", "", &targetDbName)
 		authTarget = "gnmi_" + targetDbName
-	} else if len(origin) != 0 {
+	case common_utils.RejectOrigin:
 		return grpc.Errorf(codes.Unimplemented, "Unsupported origin: %s", origin)
-	} else if target == "" {
-		// This and subsequent conditions handle target based path identification
-		// when origin == "". As per the spec it should have been treated as "openconfig".
-		// But we take a deviation and stick to legacy logic for backward compatibility
+	case common_utils.RejectEmptyTarget:
+		// Target based path identification applies when origin == "". As per
+		// the spec it should have been treated as "openconfig", but we take a
+		// deviation and stick to legacy logic for backward compatibility.
 		return grpc.Errorf(codes.Unimplemented, "Empty target data not supported")
-	} else if target == "OTHERS" {
+	case common_utils.BackendHost:
 		dc, err = sdc.NewNonDbClient(paths, prefix)
 		authTarget = "gnmi_others"
-	} else if target == "SHOW" {
+	case common_utils.RejectShow:
 		return grpc.Errorf(codes.Unimplemented, "SHOW does not support subscribe operations")
-	} else if (target == "EVENTS") && (mode == gnmipb.SubscriptionList_STREAM) {
+	case common_utils.BackendEvents:
 		dc, err = sdc.NewEventClient(paths, prefix, c.logLevel)
 		authTarget = "gnmi_events"
-	} else if targetDbName, ok, _, _ := sdc.IsTargetDb(target); ok {
+	case common_utils.BackendDB:
+		targetDbName, _, _ := common_utils.SplitDbTarget(target)
 		dc, err = sdc.NewDbClient(paths, prefix)
 		authTarget = "gnmi_" + targetDbName
-	} else {
-		/* For any other target or no target create new Transl Client. */
-		dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions, sdc.TranslWildcardOption{})
+	default:
+		// A Backend value with no arm here: a bug, reported rather than
+		// left to a nil client.
+		return grpc.Errorf(codes.Internal, "no client for backend %d", backend)
 	}
 
 	if err != nil {
