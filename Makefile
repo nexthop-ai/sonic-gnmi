@@ -288,6 +288,11 @@ endif
 	$(SUDO_GO) CGO_LDFLAGS="$(CGO_LDFLAGS)" CGO_CXXFLAGS="$(CGO_CXXFLAGS)" $(GO) test -race $(TEST_FLAGS) -coverprofile=coverage-dbus.txt -covermode=atomic -mod=vendor -v github.com/sonic-net/sonic-gnmi/sonic_service_client
 	$(SUDO_GO) CGO_LDFLAGS="$(CGO_LDFLAGS)" CGO_CXXFLAGS="$(CGO_CXXFLAGS)" $(TESTENV) $(GO) test -race $(TEST_FLAGS) -coverprofile=coverage-translutils.txt -covermode=atomic -mod=vendor -v github.com/sonic-net/sonic-gnmi/transl_utils
 	$(SUDO_GO) CGO_LDFLAGS="$(CGO_LDFLAGS)" CGO_CXXFLAGS="$(CGO_CXXFLAGS)" $(TESTENV) $(GO) test -race $(TEST_FLAGS) -coverprofile=coverage-gnoi-client-system.txt -covermode=atomic -mod=vendor -v github.com/sonic-net/sonic-gnmi/gnoi_client/system
+<<<<<<< HEAD
+=======
+	$(SUDO_GO) CGO_LDFLAGS="$(CGO_LDFLAGS)" CGO_CXXFLAGS="$(CGO_CXXFLAGS)" $(GO) test -race $(TEST_FLAGS) -coverprofile=coverage-common-utils.txt -covermode=atomic -mod=vendor -v github.com/sonic-net/sonic-gnmi/common_utils
+	$(SUDO_GO) CGO_LDFLAGS="$(CGO_LDFLAGS)" CGO_CXXFLAGS="$(CGO_CXXFLAGS)" $(GO) test -race $(TEST_FLAGS) -coverprofile=coverage-substate.txt -covermode=atomic -mod=vendor -v github.com/sonic-net/sonic-gnmi/substate
+>>>>>>> 21c3fde (NOS-8352: [substate] gRPC stats handlers for subscription state (#335))
 
 	# Filter out "mocks" and generated "proto" files from the coverage reports
 	for file in coverage-*.txt; do grep -v -e "/mocks/" -e "proto/" $$file > $$file.filtered; done
@@ -304,7 +309,13 @@ INTEGRATION_BASIC_PKGS := \
 	github.com/sonic-net/sonic-gnmi/sonic_db_config \
 	github.com/sonic-net/sonic-gnmi/sonic_service_client \
 	github.com/sonic-net/sonic-gnmi/telemetry \
+<<<<<<< HEAD
 	github.com/sonic-net/sonic-gnmi/sonic_data_client
+=======
+	github.com/sonic-net/sonic-gnmi/sonic_data_client \
+	github.com/sonic-net/sonic-gnmi/common_utils \
+	github.com/sonic-net/sonic-gnmi/substate
+>>>>>>> 21c3fde (NOS-8352: [substate] gRPC stats handlers for subscription state (#335))
 
 # Integration test packages that need special environment
 INTEGRATION_ENV_PKGS := \
