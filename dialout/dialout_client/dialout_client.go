@@ -11,7 +11,11 @@ import (
 	"sync"
 	"time"
 
+<<<<<<< HEAD
 	"github.com/sonic-net/sonic-gnmi/internal/redisopts"
+=======
+	"github.com/sonic-net/sonic-gnmi/common_utils"
+>>>>>>> 941adff (NOS-17116: Dial out to collectors in the VRF configured on TELEMETRY_CLIENT Global (#356))
 	spb "github.com/sonic-net/sonic-gnmi/proto"
 	sdc "github.com/sonic-net/sonic-gnmi/sonic_data_client"
 	sdcfg "github.com/sonic-net/sonic-gnmi/sonic_db_config"
@@ -68,6 +72,9 @@ var (
 		"stream":   Stream,
 	}
 	clientCfg *ClientConfig
+	// globalDefaults is the configuration the current run started with,
+	// which a Global field falls back to when it is removed.
+	globalDefaults ClientConfig
 	// Global mutex for protecting the config data
 	configMu sync.Mutex
 
@@ -97,6 +104,7 @@ func (d Destination) Validate() error {
 // Global config for all clients
 type ClientConfig struct {
 	SrcIp          string
+	Vrf            string // VRF device the dial-out sockets bind to; "" or "default" means none
 	RetryInterval  time.Duration
 	Encoding       gpb.Encoding
 	Unidirectional bool        // by default, no reponse from remote server
@@ -254,6 +262,17 @@ func (cs *clientSubscription) String() string {
 		cs.name, cs.destGroupName, cs.reportType, cs.prefix.GetTarget(), cs.paths, cs.interval, cs.sendMsg, cs.recvMsg)
 }
 
+// vrfDialer returns a gRPC context dialer whose sockets are bound to the VRF
+// device vrf before connecting, so the connection is routed by that VRF's
+// table. Binding by source address cannot do this: a Linux VRF only steers
+// sockets bound to its device.
+func vrfDialer(vrf string) func(context.Context, string) (net.Conn, error) {
+	d := &net.Dialer{Control: common_utils.BindToDevice(vrf)}
+	return func(ctx context.Context, addr string) (net.Conn, error) {
+		return d.DialContext(ctx, "tcp", addr)
+	}
+}
+
 // newClient returns a new initialized GNMIDialout client.
 // it connects to destination and publish service
 // TODO: TLS credential support
@@ -267,6 +286,11 @@ func newClient(ctx context.Context, dest Destination) (*Client, error) {
 	}
 	if clientCfg.TLS != nil {
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(clientCfg.TLS)))
+	}
+	if clientCfg.Vrf != "" && clientCfg.Vrf != "default" {
+		// WithReturnConnectionError keeps the dialer's error, such as a bind
+		// to a VRF device that does not exist, instead of only the deadline.
+		opts = append(opts, grpc.WithContextDialer(vrfDialer(clientCfg.Vrf)), grpc.WithReturnConnectionError())
 	}
 	conn, err := grpc.DialContext(ctx, dest.Addrs, opts...)
 	if err != nil {
@@ -414,6 +438,7 @@ restart: //Remote server might go down, in that case we restart with next destin
 	// telemetry client  global configuration
 	Key         = TELEMETRY_CLIENT|Global
 	src_ip      = IP
+	vrf         = "default" / "mgmt"   ; VRF the dial-out connections are made in
 	retry_interval = 1*4DIGIT     ; In second
 	encoding    = "JSON_IETF" / "ASCII" / "BYTES" / "PROTO"
 	unidirectional = "true" / "false"    ; true by default
@@ -456,11 +481,26 @@ func closeDestGroupClient(destGroupName string) {
 func setupDestGroupClients(ctx context.Context, destGroupName string) {
 	if names, ok := DestGrp2ClientSubMap[destGroupName]; ok {
 		for _, name := range names {
-			// Create a copy of Client subscription, existing one might be closing, don't interfere with it.
-			cs := *ClientSubscriptionNameMap[name]
+			// A new instance from the entry's configuration; the one being
+			// closed keeps its own runtime state and is not touched. The new
+			// one has its own context, so it can be cancelled on its own.
+			old := ClientSubscriptionNameMap[name]
+			if old == nil {
+				continue
+			}
+			cs := &clientSubscription{
+				name:          old.name,
+				destGroupName: old.destGroupName,
+				prefix:        old.prefix,
+				paths:         old.paths,
+				reportType:    old.reportType,
+				interval:      old.interval,
+			}
+			cctx, cancel := context.WithCancel(ctx)
+			cs.cancel = cancel
 			log.V(2).Infof("NewInstance with destGroup change for %s to %s", name, destGroupName)
-			cs.NewInstance(ctx)
-			ClientSubscriptionNameMap[name] = &cs
+			cs.NewInstance(cctx)
+			ClientSubscriptionNameMap[name] = cs
 		}
 	}
 }
@@ -499,38 +539,37 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 	configMu.Lock()
 	defer configMu.Unlock()
 
-	ctx, cancel := context.WithCancel(ctx)
-
 	if key == "Global" {
-		if op == "hdel" {
-			log.V(2).Infof("Invalid delete operation for %v", tableKey)
-			return fmt.Errorf("Invalid delete operation for %v", tableKey)
-		} else {
-			for field, value := range fv {
-				switch field {
-				case "src_ip":
-					clientCfg.SrcIp = value
-				case "retry_interval":
-					//TODO: check validity of the interval
-					itvl, err := strconv.ParseUint(value, 10, 64)
-					if err != nil {
-						log.V(2).Infof("Invalid retry_interval %v %v", value, err)
-						continue
-					}
-					clientCfg.RetryInterval = time.Second * time.Duration(itvl)
-				case "encoding":
-					//Flexible encoding Not supported yet
-					clientCfg.Encoding = gpb.Encoding_JSON_IETF
-				case "unidirectional":
-					// No PublishResponse supported yet
-					clientCfg.Unidirectional = true
+		// The row is read whole, whether a field was set or removed: the
+		// whole config goes back to what the run started with, then the
+		// row's fields are applied on top, so a removed field is reset too.
+		*clientCfg = globalDefaults
+		for field, value := range fv {
+			switch field {
+			case "src_ip":
+				clientCfg.SrcIp = value
+			case "vrf":
+				clientCfg.Vrf = value
+			case "retry_interval":
+				//TODO: check validity of the interval
+				itvl, err := strconv.ParseUint(value, 10, 64)
+				if err != nil {
+					log.V(2).Infof("Invalid retry_interval %v %v", value, err)
+					continue
 				}
+				clientCfg.RetryInterval = time.Second * time.Duration(itvl)
+			case "encoding":
+				//Flexible encoding Not supported yet
+				clientCfg.Encoding = gpb.Encoding_JSON_IETF
+			case "unidirectional":
+				// No PublishResponse supported yet
+				clientCfg.Unidirectional = true
 			}
-			// Apply changes to all running instances
-			for grpName := range destGrpNameMap {
-				closeDestGroupClient(grpName)
-				setupDestGroupClients(ctx, grpName)
-			}
+		}
+		// Apply changes to all running instances
+		for grpName := range destGrpNameMap {
+			closeDestGroupClient(grpName)
+			setupDestGroupClients(ctx, grpName)
 		}
 	} else if destGroupName, matched := matchRowPrefix(key, "DestinationGroup", separator); matched {
 		if destGroupName == "" {
@@ -597,6 +636,7 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 		} else {
 			// TODO: start one subscription publish routine for this request
 			// Only start routine when DestGrp2ClientSubMap is not empty, or ...?
+			ctx, cancel := context.WithCancel(ctx)
 			cs := clientSubscription{
 				interval: 5000 * time.Millisecond, // default to 5000 milliseconds
 				name:     name,
@@ -665,6 +705,7 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 // read configDB data for telemetry client and start publishing service for client subscription
 func DialOutRun(ctx context.Context, ccfg *ClientConfig) error {
 	clientCfg = ccfg
+	globalDefaults = *ccfg
 	ns, _ := sdcfg.GetDbDefaultNamespace()
 	dbn, err := sdcfg.GetDbId("CONFIG_DB", ns)
 	if err != nil {

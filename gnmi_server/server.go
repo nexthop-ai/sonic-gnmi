@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/Azure/sonic-mgmt-common/translib"
@@ -521,21 +520,7 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 
 // NewServer returns an initialized Server.
 func createVrfListener(vrf string, port int64) (net.Listener, error) {
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			var err error
-			ctrlErr := c.Control(func(fd uintptr) {
-				err = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, vrf)
-			})
-			if ctrlErr != nil {
-				return ctrlErr
-			}
-			if err != nil {
-				return fmt.Errorf("failed to bind socket to VRF %s: %v", vrf, err)
-			}
-			return nil
-		},
-	}
+	lc := net.ListenConfig{Control: common_utils.BindToDevice(vrf)}
 
 	listener, err := lc.Listen(context.Background(), "tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
