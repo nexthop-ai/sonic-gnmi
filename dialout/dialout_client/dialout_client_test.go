@@ -12,10 +12,16 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
+<<<<<<< HEAD
+=======
+	"sync"
+	"sync/atomic"
+>>>>>>> 8abca10 (NOS-20431: dialout: detect collector close on idle stream subscriptions (#381))
 	"testing"
 	"time"
 
 	sds "github.com/sonic-net/sonic-gnmi/dialout/dialout_server"
+	spb "github.com/sonic-net/sonic-gnmi/proto"
 	sdc "github.com/sonic-net/sonic-gnmi/sonic_data_client"
 	sdcfg "github.com/sonic-net/sonic-gnmi/sonic_db_config"
 	testcert "github.com/sonic-net/sonic-gnmi/testdata/tls"
@@ -60,8 +66,12 @@ func loadDB(t *testing.T, rclient *redis.Client, mpi map[string]interface{}) {
 	}
 }
 
+// The certificate is generated once: an RSA-4096 key takes long enough that
+// a fresh one on every collector restart would distort reconnect timings.
+var serverCert = sync.OnceValues(testcert.NewCert)
+
 func createServer(t *testing.T, cfg *sds.Config) *sds.Server {
-	certificate, err := testcert.NewCert()
+	certificate, err := serverCert()
 	if err != nil {
 		t.Fatalf("could not load server key pair: %s", err)
 	}
@@ -643,3 +653,388 @@ func TestMatchRowPrefix(t *testing.T) {
 		}
 	}
 }
+<<<<<<< HEAD
+=======
+
+// waitForFullDump waits for a SyncResponse in store and checks that the dump
+// before it carried at least one update.
+func waitForFullDump(t *testing.T, store *[]*pb.SubscribeResponse, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for i, resp := range *store {
+			if !resp.GetSyncResponse() {
+				continue
+			}
+			for _, prev := range (*store)[:i] {
+				if len(prev.GetUpdate().GetUpdate()) > 0 {
+					return
+				}
+			}
+			t.Fatalf("SyncResponse without a preceding update: %v", *store)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("no SyncResponse within %v, got %v", timeout, *store)
+}
+
+// startIdleStream sets a short retry interval, starts collector S1 and opens a
+// stream subscription on COUNTERS/Ethernet68, which the test never writes to.
+// It returns once the initial dump has reached the collector.
+func startIdleStream(t *testing.T, name string) (*clientSubscription, context.CancelFunc) {
+	prepareDb(t)
+
+	saved := clientCfg
+	t.Cleanup(func() {
+		// publishRun can still be retrying after the test and reads clientCfg,
+		// so a nil left by running this test alone is not restored.
+		if saved != nil {
+			clientCfg = saved
+		}
+	})
+	clientCfg = &ClientConfig{
+		RetryInterval:  2 * time.Second,
+		Encoding:       pb.Encoding_JSON_IETF,
+		Unidirectional: true,
+		TLS:            &tls.Config{InsecureSkipVerify: true},
+	}
+	destGrpNameMap[name] = []Destination{{Addrs: "127.0.0.1:8080"}}
+	t.Cleanup(func() { delete(destGrpNameMap, name) })
+
+	cs := &clientSubscription{
+		name:          name,
+		destGroupName: name,
+		prefix:        &pb.Path{Target: "COUNTERS_DB"},
+		paths: []*pb.Path{{
+			Elem: []*pb.PathElem{{Name: "COUNTERS"}, {Name: "Ethernet68"}},
+		}},
+		reportType: Stream,
+	}
+
+	var first []*pb.SubscribeResponse
+	serverOp(t, S1Start)
+	t.Cleanup(func() { serverOp(t, S1Stop) })
+	s1.SetDataStore(&first)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := cs.NewInstance(ctx); err != nil {
+		t.Fatalf("NewInstance: %v", err)
+	}
+	t.Cleanup(cs.Close)
+	waitForFullDump(t, &first, 5*time.Second)
+	return cs, cancel
+}
+
+// A stream subscription with no DB changes must still notice the collector
+// going away and reconnect once it is back. A session that lasted longer than
+// RetryInterval reconnects without first waiting out RetryInterval.
+func TestGNMIDialOutStreamReconnectsAfterIdleCollectorRestart(t *testing.T) {
+	startIdleStream(t, "idle_restart")
+	time.Sleep(clientCfg.RetryInterval)
+
+	serverOp(t, S1Stop)
+	var second []*pb.SubscribeResponse
+	serverOp(t, S1Start)
+	s1.SetDataStore(&second)
+
+	waitForFullDump(t, &second, clientCfg.RetryInterval)
+}
+
+// Closing a live stream and cancelling its context, as a TELEMETRY_CLIENT
+// edit does, must stop the instance: it must not keep redialing.
+func TestGNMIDialOutStreamClientCloseStops(t *testing.T) {
+	cs, cancel := startIdleStream(t, "client_close")
+
+	cs.Close()
+	cancel()
+	time.Sleep(2 * clientCfg.RetryInterval)
+	before := atomic.LoadUint64(&cs.conTryCnt)
+	time.Sleep(3 * clientCfg.RetryInterval)
+	if after := atomic.LoadUint64(&cs.conTryCnt); after != before {
+		t.Errorf("closed instance still dialing: attempts %d -> %d", before, after)
+	}
+}
+
+// closingCollector accepts every Publish stream and ends it at once.
+type closingCollector struct{}
+
+func (closingCollector) Publish(spb.GNMIDialOut_PublishServer) error { return nil }
+
+// A stream whose collector accepts and immediately closes it must pause
+// RetryInterval before each redial instead of looping.
+func TestGNMIDialOutStreamShortSessionPauses(t *testing.T) {
+	prepareDb(t)
+	saved := clientCfg
+	t.Cleanup(func() {
+		if saved != nil {
+			clientCfg = saved
+		}
+	})
+	clientCfg = &ClientConfig{RetryInterval: time.Second, TLS: &tls.Config{InsecureSkipVerify: true}}
+
+	cert, err := serverCert()
+	if err != nil {
+		t.Fatalf("could not load server key pair: %s", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}})))
+	spb.RegisterGNMIDialOutServer(srv, closingCollector{})
+	go srv.Serve(ln)
+	defer srv.Stop()
+
+	name := "short_session"
+	destGrpNameMap[name] = []Destination{{Addrs: ln.Addr().String()}}
+	defer delete(destGrpNameMap, name)
+	cs := &clientSubscription{
+		name:          name,
+		destGroupName: name,
+		prefix:        &pb.Path{Target: "COUNTERS_DB"},
+		paths: []*pb.Path{{
+			Elem: []*pb.PathElem{{Name: "COUNTERS"}, {Name: "Ethernet68"}},
+		}},
+		reportType: Stream,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := cs.NewInstance(ctx); err != nil {
+		t.Fatalf("NewInstance: %v", err)
+	}
+	defer cs.Close()
+
+	window := 5 * clientCfg.RetryInterval
+	time.Sleep(window)
+	// One attempt per RetryInterval, plus the first and some slack. At least
+	// two shows the client kept reconnecting rather than stalling.
+	if n := atomic.LoadUint64(&cs.conTryCnt); n < 2 || n > 7 {
+		t.Errorf("%d connection attempts in %v, want about one per %v", n, window, clientCfg.RetryInterval)
+	}
+}
+
+// TestVrfDialer checks that the dialer binds the socket to the named device
+// before connecting: an unknown device fails the dial with the bind error, and
+// the loopback device still reaches a loopback listener. Since Linux 5.7 an
+// unbound socket may be bound to a device without privileges.
+func TestVrfDialer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = vrfDialer("no-such-vrf")(ctx, ln.Addr().String())
+	if err == nil || !strings.Contains(err.Error(), "failed to bind socket to VRF no-such-vrf") {
+		t.Fatalf("dial through unknown VRF: got %v, want bind error", err)
+	}
+
+	conn, err := vrfDialer("lo")(ctx, ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial bound to lo: %v", err)
+	}
+	conn.Close()
+}
+
+// TestNewClientVrf checks that newClient dials through the configured VRF:
+// with an unknown VRF the dial fails with the bind error (not just the
+// deadline), and bound to lo it reaches the test dial-out server.
+func TestNewClientVrf(t *testing.T) {
+	saved := clientCfg
+	defer func() { clientCfg = saved }()
+	serverOp(t, S1Start)
+	defer serverOp(t, S1Stop)
+	time.Sleep(200 * time.Millisecond)
+	dest := Destination{Addrs: "127.0.0.1:8080"}
+
+	clientCfg = &ClientConfig{
+		RetryInterval: 3 * time.Second,
+		Vrf:           "no-such-vrf",
+		TLS:           &tls.Config{InsecureSkipVerify: true},
+	}
+	_, err := newClient(context.Background(), dest)
+	if err == nil || !strings.Contains(err.Error(), "failed to bind socket to VRF no-such-vrf") {
+		t.Fatalf("newClient with unknown VRF: got %v, want bind error", err)
+	}
+
+	clientCfg.Vrf = "lo"
+	c, err := newClient(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("newClient bound to lo: %v", err)
+	}
+	c.Close()
+
+	// "default" is a value the YANG model offers, not a device name: it must
+	// dial without binding, or a collector configured with it is unreachable.
+	clientCfg.Vrf = "default"
+	c, err = newClient(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("newClient with vrf default: %v", err)
+	}
+	c.Close()
+}
+
+// The defaults a Global edit falls back to are the config DialOutRun was
+// started with; a Global row that carries only vrf must leave the rest alone.
+func TestDialOutRunGlobalDefaults(t *testing.T) {
+	savedCfg, savedDefaults, savedGroups := clientCfg, globalDefaults, destGrpNameMap
+	exe_cmd(t, "redis-cli -n 4 del TELEMETRY_CLIENT|Global")
+	// Whatever an earlier test left here must not stand in for the capture.
+	globalDefaults = ClientConfig{}
+
+	cfg := ClientConfig{
+		RetryInterval: 5 * time.Second,
+		Encoding:      pb.Encoding_JSON_IETF,
+		TLS:           &tls.Config{InsecureSkipVerify: true},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- DialOutRun(ctx, &cfg) }()
+	defer func() {
+		// DialOutRun only checks its context after a keyspace event, so the
+		// delete that cleans the row up is also what makes it return.
+		cancel()
+		exe_cmd(t, "redis-cli -n 4 del TELEMETRY_CLIENT|Global")
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("DialOutRun did not return after cancel")
+		}
+		clientCfg, globalDefaults, destGrpNameMap = savedCfg, savedDefaults, savedGroups
+	}()
+
+	exe_cmd(t, "redis-cli -n 4 hset TELEMETRY_CLIENT|Global vrf mgmt")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		configMu.Lock()
+		vrf, retry := cfg.Vrf, cfg.RetryInterval
+		configMu.Unlock()
+		if vrf == "mgmt" {
+			if retry != 5*time.Second {
+				t.Fatalf("after Global row with only vrf: RetryInterval=%v, want the 5s DialOutRun started with", retry)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Global row not applied by DialOutRun: Vrf=%q", vrf)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestGlobalVrfConfig checks that the vrf field of TELEMETRY_CLIENT|Global is
+// applied to the client config, cleared when the field is removed with HDEL,
+// and cleared again when the whole row is deleted.
+func TestGlobalVrfConfig(t *testing.T) {
+	savedCfg, savedDefaults, savedGroups := clientCfg, globalDefaults, destGrpNameMap
+	clientCfg = &ClientConfig{RetryInterval: 5 * time.Second}
+	globalDefaults = *clientCfg
+	destGrpNameMap = make(map[string][]Destination)
+	defer func() { clientCfg, globalDefaults, destGrpNameMap = savedCfg, savedDefaults, savedGroups }()
+
+	rclient := getConfigDbClient(t)
+	defer rclient.Close()
+	defer exe_cmd(t, "redis-cli -n 4 del TELEMETRY_CLIENT|Global")
+
+	process := func(op string) {
+		if err := processTelemetryClientConfig(context.Background(), rclient, "Global", op); err != nil {
+			t.Fatalf("processTelemetryClientConfig(%s): %v", op, err)
+		}
+	}
+	exe_cmd(t, "redis-cli -n 4 hset TELEMETRY_CLIENT|Global retry_interval 7 vrf mgmt")
+	process("hset")
+	if clientCfg.Vrf != "mgmt" || clientCfg.RetryInterval != 7*time.Second {
+		t.Fatalf("after hset: Vrf=%q RetryInterval=%v, want mgmt 7s", clientCfg.Vrf, clientCfg.RetryInterval)
+	}
+
+	exe_cmd(t, "redis-cli -n 4 hdel TELEMETRY_CLIENT|Global vrf")
+	process("hdel")
+	if clientCfg.Vrf != "" || clientCfg.RetryInterval != 7*time.Second {
+		t.Fatalf("after hdel vrf: Vrf=%q RetryInterval=%v, want empty 7s", clientCfg.Vrf, clientCfg.RetryInterval)
+	}
+
+	exe_cmd(t, "redis-cli -n 4 hset TELEMETRY_CLIENT|Global vrf mgmt")
+	process("hset")
+	exe_cmd(t, "redis-cli -n 4 del TELEMETRY_CLIENT|Global")
+	process("hdel")
+	if clientCfg.Vrf != "" || clientCfg.RetryInterval != 5*time.Second {
+		t.Fatalf("after del row: Vrf=%q RetryInterval=%v, want defaults", clientCfg.Vrf, clientCfg.RetryInterval)
+	}
+}
+
+// TestGlobalEditStopsOldInstances checks that every Global edit stops the
+// instances it replaces: an instance retrying a collector that refuses
+// connections counts attempts until it is cancelled, so the counters of the
+// replaced instances must stand still after a second edit.
+func TestGlobalEditStopsOldInstances(t *testing.T) {
+	savedCfg, savedDefaults := clientCfg, globalDefaults
+	savedGroups, savedSubs, savedUsers := destGrpNameMap, ClientSubscriptionNameMap, DestGrp2ClientSubMap
+	clientCfg = &ClientConfig{RetryInterval: time.Second, TLS: &tls.Config{InsecureSkipVerify: true}}
+	globalDefaults = *clientCfg
+	destGrpNameMap = make(map[string][]Destination)
+	ClientSubscriptionNameMap = make(map[string]*clientSubscription)
+	DestGrp2ClientSubMap = make(map[string][]string)
+	defer func() {
+		for _, cs := range ClientSubscriptionNameMap {
+			cs.Close()
+			cs.cancel()
+		}
+		clientCfg, globalDefaults = savedCfg, savedDefaults
+		destGrpNameMap, ClientSubscriptionNameMap, DestGrp2ClientSubMap = savedGroups, savedSubs, savedUsers
+	}()
+	prepareDb(t)
+	rclient := getConfigDbClient(t)
+	defer rclient.Close()
+	defer exe_cmd(t, "redis-cli -n 4 del TELEMETRY_CLIENT|Global TELEMETRY_CLIENT|DestinationGroup_ORPHAN TELEMETRY_CLIENT|Subscription_ORPHAN")
+
+	process := func(key string) {
+		if err := processTelemetryClientConfig(context.Background(), rclient, key, "hset"); err != nil {
+			t.Fatalf("processTelemetryClientConfig(%s): %v", key, err)
+		}
+	}
+	// Port 1 on loopback refuses connections, so the instance keeps retrying.
+	exe_cmd(t, "redis-cli -n 4 hset TELEMETRY_CLIENT|DestinationGroup_ORPHAN dst_addr 127.0.0.1:1")
+	exe_cmd(t, "redis-cli -n 4 hmset TELEMETRY_CLIENT|Subscription_ORPHAN path_target COUNTERS_DB dst_group ORPHAN report_type stream paths COUNTERS/Ethernet*")
+	process("DestinationGroup_ORPHAN")
+	process("Subscription_ORPHAN")
+
+	var replaced []*clientSubscription
+	for _, vrf := range []string{"mgmt", "default"} {
+		replaced = append(replaced, ClientSubscriptionNameMap["ORPHAN"])
+		exe_cmd(t, "redis-cli -n 4 hset TELEMETRY_CLIENT|Global vrf "+vrf)
+		process("Global")
+	}
+	current := ClientSubscriptionNameMap["ORPHAN"]
+	for _, old := range replaced {
+		if old == current {
+			t.Fatal("Global edit did not replace the instance")
+		}
+	}
+	time.Sleep(2 * clientCfg.RetryInterval)
+	before := make([]uint64, len(replaced))
+	for i, old := range replaced {
+		before[i] = atomic.LoadUint64(&old.conTryCnt)
+	}
+	liveBefore := atomic.LoadUint64(&current.conTryCnt)
+	time.Sleep(3 * clientCfg.RetryInterval)
+	for i, old := range replaced {
+		if after := atomic.LoadUint64(&old.conTryCnt); after != before[i] {
+			t.Errorf("replaced instance %d still dialing: attempts %d -> %d", i, before[i], after)
+		}
+	}
+	if atomic.LoadUint64(&current.conTryCnt) == liveBefore {
+		t.Errorf("current instance stopped dialing: attempts stuck at %d", liveBefore)
+	}
+}
+>>>>>>> 8abca10 (NOS-20431: dialout: detect collector close on idle stream subscriptions (#381))

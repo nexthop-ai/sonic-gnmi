@@ -214,6 +214,9 @@ func (cs *clientSubscription) NewInstance(ctx context.Context) error {
 func (cs *clientSubscription) send(stream spb.GNMIDialOut_PublishClient) error {
 	for {
 		items, err := cs.q.Get(1)
+		if errors.Is(err, queue.ErrDisposed) {
+			return nil
+		}
 
 		if items == nil {
 			log.V(1).Infof("%v", err)
@@ -268,6 +271,21 @@ func newClient(ctx context.Context, dest Destination) (*Client, error) {
 	if clientCfg.TLS != nil {
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(clientCfg.TLS)))
 	}
+<<<<<<< HEAD
+=======
+	if clientCfg.Vrf != "" && clientCfg.Vrf != "default" {
+		// WithReturnConnectionError keeps the dialer's error, such as a bind
+		// to a VRF device that does not exist, instead of only the deadline.
+		opts = append(opts, grpc.WithContextDialer(vrfDialer(clientCfg.Vrf)), grpc.WithReturnConnectionError())
+	} else {
+		// Dial through a net.Dialer for its short TCP keepalive, so an idle
+		// stream notices a vanished collector host in minutes rather than hours.
+		d := &net.Dialer{}
+		opts = append(opts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			return d.DialContext(ctx, "tcp", addr)
+		}))
+	}
+>>>>>>> 8abca10 (NOS-20431: dialout: detect collector close on idle stream subscriptions (#381))
 	conn, err := grpc.DialContext(ctx, dest.Addrs, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("Dial to (%s, timeout %v): %v", dest, timeout, err)
@@ -388,8 +406,25 @@ restart: //Remote server might go down, in that case we restart with next destin
 	case Stream:
 		select {
 		default:
+			// An idle stream never calls Send, so Recv is the only way to see the
+			// collector close the stream. Disposing the queue unblocks cs.send.
+			q := cs.q
+			go func() {
+				for {
+					if _, err := pub.Recv(); err != nil {
+						// cs.Close disposes the queue before closing the connection,
+						// so a Recv error caused by our own close is not logged.
+						if !q.Disposed() {
+							log.V(1).Infof("Client %v pub Recv error:%v", cs.name, err)
+						}
+						q.Dispose()
+						return
+					}
+				}
+			}()
 			cs.w.Add(1)
 			go cs.dc.StreamRun(cs.q, cs.stop, &cs.w, nil)
+			started := time.Now()
 			time.Sleep(100 * time.Millisecond)
 			err = cs.send(pub)
 			if err != nil {
@@ -397,8 +432,13 @@ restart: //Remote server might go down, in that case we restart with next destin
 			}
 			cs.Close()
 			cs.w.Wait()
-			// Don't restart immediatly
-			time.Sleep(clientCfg.RetryInterval)
+			// The blocking dial in newClient already retries for up to
+			// RetryInterval, on gRPC's connect backoff, so only a session that died
+			// early needs a pause, to keep a collector that accepts and closes from
+			// causing a tight loop.
+			if time.Since(started) < clientCfg.RetryInterval {
+				time.Sleep(clientCfg.RetryInterval)
+			}
 			goto restart
 
 		case <-cs.stop:

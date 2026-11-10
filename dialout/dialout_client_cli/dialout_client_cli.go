@@ -28,7 +28,7 @@ var (
 func init() {
 	flag.StringVar(&clientCfg.TLS.ServerName, "server_name", "", "When set, use this hostname to verify server certificate during TLS handshake.")
 	flag.BoolVar(&clientCfg.TLS.InsecureSkipVerify, "insecure", false, "When set, client will not verify the server certificate during TLS handshake.")
-	flag.DurationVar(&clientCfg.RetryInterval, "retry_interval", 30*time.Second, "Interval at which client tries to reconnect to destination servers")
+	flag.DurationVar(&clientCfg.RetryInterval, "retry_interval", 30*time.Second, "How long each connection attempt to a destination server lasts, and the pause before reconnecting after a stream connection that lasted less")
 	flag.BoolVar(&clientCfg.Unidirectional, "unidirectional", true, "No repesponse from server is expected")
 }
 

@@ -59,8 +59,13 @@ The configuration of dialout telemetry in SONiC is implemented with reference to
 There are three categories of configuration:
 * Global
   * encoding:  It may be one of `JSON_IETF`, `ASCII`, `BYTES`  and `PROTO`.  Default value is JSON_IETF.
+<<<<<<< HEAD
   * src_ip: Source ip address of the connection from device, if not specificied, the device management IP will be used.
   * retry_interval: When connection to collector is down, how long dialout client should wait before retry. 30 seconds by default.
+=======
+  * src_ip: Source IP address for the connections to the collectors. The field is accepted but not applied yet: the connections use whatever source address the kernel picks for the route. Use `vrf` to reach collectors over the management network.
+  * retry_interval: How long dialout client keeps trying to connect to a collector before moving to the next one in the DestinationGroup. A stream subscription whose connection lasted less than this also waits this long before reconnecting, so a collector that accepts and drops connections is not redialled in a tight loop; one that lasted longer reconnects at once. 30 seconds by default.
+>>>>>>> 8abca10 (NOS-20431: dialout: detect collector close on idle stream subscriptions (#381))
   * unidirectional: Whether to make the Publish RPC one directly only, no PublishResponse is expected by default.
 * DestinationGroup
   * dst_addr: Multiple IP address plus port number of the collectors may be specified. dialout client will try the next one in a DesistinationGroup if current one got disconnected due to failure.
