@@ -2378,7 +2378,7 @@ func (c *MixedDbClient) dbTableKeySubscribe(gnmiPath *gnmipb.Path, interval time
 			}
 			intervalTicker = GetIntervalTicker()(interval)
 		case <-c.channel:
-			log.V(1).Infof("Stopping dbTableKeySubscribe routine for %v ", c.pathG2S)
+			log.V(1).Infof("Stopping dbTableKeySubscribe routine for %v", tblPaths)
 			return
 		}
 	}
