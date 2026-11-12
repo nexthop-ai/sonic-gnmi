@@ -59,18 +59,25 @@ The configuration of dialout telemetry in SONiC is implemented with reference to
 There are three categories of configuration:
 * Global
   * encoding:  It may be one of `JSON_IETF`, `ASCII`, `BYTES`  and `PROTO`.  Default value is JSON_IETF.
+<<<<<<< HEAD
   * src_ip: Source ip address of the connection from device, if not specificied, the device management IP will be used.
   * retry_interval: When connection to collector is down, how long dialout client should wait before retry. 30 seconds by default.
   * unidirectional: Whether to make the Publish RPC one directly only, no PublishResponse is expected by default.
+=======
+  * src_ip: Source IP address for the connections to the collectors. The field is accepted but not applied yet: the connections use whatever source address the kernel picks for the route. Use `vrf` to reach collectors over the management network.
+  * retry_interval: How long dialout client keeps trying to connect to a collector before moving to the next one in the DestinationGroup. A stream subscription whose connection lasted less than this also waits this long before reconnecting, so a collector that accepts and drops connections is not redialled in a tight loop; one that lasted longer reconnects at once. From 1 to 9999 seconds, 30 by default. A Global row with any other value is refused whole and reported at `-v 1`: none of it is applied.
+  * unidirectional: Whether to make the Publish RPC one directly only, no PublishResponse is expected by default.
+  * vrf: The VRF the connections to the collectors are made in, `default` or `mgmt`. Set it to `mgmt` when the management VRF is enabled and the collectors are reached over the management network; without it the connections are made in the default VRF. Only the connection is bound to the VRF: name lookup is not, so use IP addresses in `dst_addr`, not hostnames, when the collectors are reached over the management VRF.
+>>>>>>> 5ee58df (NOS-20765: [dialout] Validate a destination as host:port before dialling (#359))
 * DestinationGroup
-  * dst_addr: Multiple IP address plus port number of the collectors may be specified. dialout client will try the next one in a DesistinationGroup if current one got disconnected due to failure.
+  * dst_addr: One or more collector endpoints as `host:port`, separated by commas. The host is an IPv4 address or an IPv6 address in square brackets, e.g. `10.0.0.1:8080,[fd00:1::1]:8080`; these are the forms the YANG model allows. A hostname written straight to CONFIG_DB is accepted too, but name lookup is not bound to the VRF the connection is made in, so use IP addresses when the collectors are reached over the management VRF. dialout client will try the next one in a DestinationGroup if current one got disconnected due to failure. A row with any malformed endpoint is refused whole and reported at `-v 1`; the group keeps the endpoints it had. Deleting a DestinationGroup stops the subscriptions that use it; they start again when a group with that name is configured.
   Number of DestinationGroups is not limited.
 * Subscription
   * dst_group: The DestinationGroup to be used by this subscription.
   * path_target: The DB target for this subscription
   * paths:  The list of paths subscribed to in this instance of subscription.
-  * report_type: May be one of "periodic", "stream" or "once". "periodic" is the default value
-  * report_interval:  How frequent the data for all paths should be sent to collector, in millisecond, default value is "5000".
+  * report_type: "periodic" or "stream". "periodic" is the default value. A row with any other value is refused whole and reported at `-v 1`; the running subscription is left as it was.
+  * report_interval:  How frequent the data for all paths should be sent to collector, in millisecond, from 1 to 99999999, default value is "5000". A row with any other value is refused whole.
 
 One example configuration:
 ```

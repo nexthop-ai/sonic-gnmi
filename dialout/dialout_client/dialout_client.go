@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,11 +88,40 @@ type Destination struct {
 	Addrs string
 }
 
+// hostnameRe matches dot-separated labels of letters, digits and inner hyphens.
+var hostnameRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$`)
+
+// isHostname accepts what hostnameRe matches unless the last label is all
+// digits: that is a malformed IPv4 address such as 256.1.1.1, not a name.
+func isHostname(host string) bool {
+	last := host[strings.LastIndex(host, ".")+1:]
+	return hostnameRe.MatchString(host) && strings.Trim(last, "0123456789") != ""
+}
+
+// Validate checks that Addrs is a single host:port endpoint: the host is an IP
+// address or a hostname and the port is in 1-65535. An IPv6 host must be
+// bracketed ([fd00:1::1]:8080): bare "fd00:1::1:8080" is ambiguous and
+// net.SplitHostPort rejects it.
 func (d Destination) Validate() error {
 	if len(d.Addrs) == 0 {
 		return errors.New("Destination.Addrs is empty")
 	}
-	// TODO: validate Addrs is in format IP:PORT
+	host, port, err := net.SplitHostPort(d.Addrs)
+	if err != nil {
+		return fmt.Errorf("Destination.Addrs %q is not host:port: %v", d.Addrs, err)
+	}
+	if host == "" {
+		return fmt.Errorf("Destination.Addrs %q is missing a host", d.Addrs)
+	}
+	// SplitHostPort checks the brackets, not the host itself: " 10.0.0.1" or
+	// "col lector" would pass and then fail every dial. A zone (fe80::1%eth0)
+	// is allowed.
+	if _, err := netip.ParseAddr(host); err != nil && !isHostname(host) {
+		return fmt.Errorf("Destination.Addrs %q has host %q, want an IP address or a hostname", d.Addrs, host)
+	}
+	if p, err := strconv.ParseUint(port, 10, 16); err != nil || p == 0 {
+		return fmt.Errorf("Destination.Addrs %q has port %q, want 1-65535", d.Addrs, port)
+	}
 	return nil
 }
 
@@ -254,6 +285,32 @@ func (cs *clientSubscription) String() string {
 		cs.name, cs.destGroupName, cs.reportType, cs.prefix.GetTarget(), cs.paths, cs.interval, cs.sendMsg, cs.recvMsg)
 }
 
+<<<<<<< HEAD
+=======
+// dialTarget hands addr to gRPC as written. The passthrough scheme stops a
+// host such as "dns" from being read as a resolver scheme, and the zone
+// separator of a link-local IPv6 address must be escaped in a URL.
+func dialTarget(addr string) string {
+	return "passthrough:///" + strings.ReplaceAll(addr, "%", "%25")
+}
+
+// vrfDialer returns a gRPC context dialer that dials TCP whatever the address
+// looks like: gRPC's own dialer reads "unix:8080" as a socket path. For a VRF
+// other than the default, its sockets are bound to the VRF device before
+// connecting, so the connection is routed by that VRF's table. Binding by
+// source address cannot do this: a Linux VRF only steers sockets bound to its
+// device.
+func vrfDialer(vrf string) func(context.Context, string) (net.Conn, error) {
+	d := &net.Dialer{}
+	if vrf != "" && vrf != "default" {
+		d.Control = common_utils.BindToDevice(vrf)
+	}
+	return func(ctx context.Context, addr string) (net.Conn, error) {
+		return d.DialContext(ctx, "tcp", addr)
+	}
+}
+
+>>>>>>> 5ee58df (NOS-20765: [dialout] Validate a destination as host:port before dialling (#359))
 // newClient returns a new initialized GNMIDialout client.
 // it connects to destination and publish service
 // TODO: TLS credential support
@@ -264,11 +321,19 @@ func newClient(ctx context.Context, dest Destination) (*Client, error) {
 
 	opts := []grpc.DialOption{
 		grpc.WithBlock(),
+		grpc.WithContextDialer(vrfDialer(clientCfg.Vrf)),
+		// Report the dialer's error, such as a bind to a VRF device that
+		// does not exist, not only the deadline.
+		grpc.WithReturnConnectionError(),
 	}
 	if clientCfg.TLS != nil {
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(clientCfg.TLS)))
 	}
+<<<<<<< HEAD
 	conn, err := grpc.DialContext(ctx, dest.Addrs, opts...)
+=======
+	conn, err := grpc.DialContext(ctx, dialTarget(dest.Addrs), opts...)
+>>>>>>> 5ee58df (NOS-20765: [dialout] Validate a destination as host:port before dialling (#359))
 	if err != nil {
 		return nil, fmt.Errorf("Dial to (%s, timeout %v): %v", dest, timeout, err)
 	}
@@ -413,25 +478,31 @@ restart: //Remote server might go down, in that case we restart with next destin
 /*
 	// telemetry client  global configuration
 	Key         = TELEMETRY_CLIENT|Global
+<<<<<<< HEAD
 	src_ip      = IP
 	retry_interval = 1*4DIGIT     ; In second
+=======
+	src_ip      = IPv4address / IPv6address
+	vrf         = "default" / "mgmt"   ; VRF the dial-out connections are made in
+	retry_interval = 1*4DIGIT     ; In second, 1-9999
+>>>>>>> 5ee58df (NOS-20765: [dialout] Validate a destination as host:port before dialling (#359))
 	encoding    = "JSON_IETF" / "ASCII" / "BYTES" / "PROTO"
 	unidirectional = "true" / "false"    ; true by default
 
 	// Destination group
 	Key      = TELEMETRY_CLIENT|DestinationGroup_<name>
-	dst_addr   = IP1:PORT2,IP2:PORT2       ;IP addresses separated by ","
+	dst_addr   = HOST1:PORT1,HOST2:PORT2   ;endpoints separated by ","
 
-	PORT = 1*5DIGIT
-	IP = dec-octet "." dec-octet "." dec-octet "." dec-octet
+	HOST = IPv4address / "[" IPv6address "]" / hostname   ; what Validate accepts; the YANG model allows the IP forms only
+	PORT = 1*5DIGIT                                       ; 1-65535
 
 	// Subscription group
 	Key         = TELEMETRY_CLIENT|Subscription_<name>
 	path_target = DbName
 	paths       = PATH1,PATH2        ;PATH separated by ","
 	dst_group   = <name>      ; // name of DestinationGroup
-	report_type = "periodic" / "stream" / "once"
-	report_interval = 1*8DIGIT      ; In millisecond,
+	report_type = "periodic" / "stream"   ; periodic by default
+	report_interval = 1*8DIGIT      ; In millisecond, 1-99999999, 5000 by default
 
 	The sonic-telemetry_client YANG model declares the list key as "prefix name",
 	so YANG-validated tooling (config replace, GCU, golden config) spells the same
@@ -459,10 +530,35 @@ func setupDestGroupClients(ctx context.Context, destGroupName string) {
 			// Create a copy of Client subscription, existing one might be closing, don't interfere with it.
 			cs := *ClientSubscriptionNameMap[name]
 			log.V(2).Infof("NewInstance with destGroup change for %s to %s", name, destGroupName)
+<<<<<<< HEAD
 			cs.NewInstance(ctx)
 			ClientSubscriptionNameMap[name] = &cs
+=======
+			if err := cs.NewInstance(cctx); err != nil {
+				log.V(1).Infof("Subscription %v is registered but not started: %v", name, err)
+			}
+			ClientSubscriptionNameMap[name] = cs
+>>>>>>> 5ee58df (NOS-20765: [dialout] Validate a destination as host:port before dialling (#359))
 		}
 	}
+}
+
+// unregisterSubscription forgets a closed subscription: it leaves its group's
+// user list and the name map.
+func unregisterSubscription(cs *clientSubscription) {
+	names := DestGrp2ClientSubMap[cs.destGroupName]
+	for i, n := range names {
+		if n == cs.name {
+			names = append(names[:i], names[i+1:]...)
+			break
+		}
+	}
+	if len(names) == 0 {
+		delete(DestGrp2ClientSubMap, cs.destGroupName)
+	} else {
+		DestGrp2ClientSubMap[cs.destGroupName] = names
+	}
+	delete(ClientSubscriptionNameMap, cs.name)
 }
 
 // matchRowPrefix matches a TELEMETRY_CLIENT row key against a row type and returns
@@ -478,6 +574,27 @@ func matchRowPrefix(key string, rowType string, separator string) (string, bool)
 		}
 	}
 	return "", false
+}
+
+// The largest values the schema below admits: 1*4DIGIT and 1*8DIGIT.
+const (
+	maxRetryIntervalSecs = 9999
+	maxReportIntervalMs  = 99999999
+)
+
+// rowUpdated reports whether a delete event left fields under the key. A
+// keyspace hdel also fires when one field of a row is removed; the row is
+// gone only when nothing is left.
+func rowUpdated(op string, fv map[string]string) bool {
+	return op == "hdel" && len(fv) > 0
+}
+
+// applyTelemetryClientConfig applies one TELEMETRY_CLIENT row change. A
+// refused row is never retried, so the V(1) line here is the only trace of it.
+func applyTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, key string, op string) {
+	if err := processTelemetryClientConfig(ctx, redisDb, key, op); err != nil {
+		log.V(1).Infof("TELEMETRY_CLIENT %v %v refused: %v", key, op, err)
+	}
 }
 
 // start/stop/update telemetry publist client as requested
@@ -502,6 +619,7 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 	ctx, cancel := context.WithCancel(ctx)
 
 	if key == "Global" {
+<<<<<<< HEAD
 		if op == "hdel" {
 			log.V(2).Infof("Invalid delete operation for %v", tableKey)
 			return fmt.Errorf("Invalid delete operation for %v", tableKey)
@@ -531,88 +649,136 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 				closeDestGroupClient(grpName)
 				setupDestGroupClients(ctx, grpName)
 			}
+=======
+		// The row is read whole, whether a field was set or removed, and
+		// checked before any of it is applied: the config starts again from
+		// what the run started with, so a removed field is reset too, and a
+		// refused row changes nothing and re-dials nothing.
+		cfg := globalDefaults
+		for field, value := range fv {
+			switch field {
+			case "src_ip":
+				cfg.SrcIp = value
+			case "vrf":
+				cfg.Vrf = value
+			case "retry_interval":
+				// At 0 every dial has already timed out and is retried at once.
+				itvl, err := strconv.ParseUint(value, 10, 64)
+				if err != nil || itvl == 0 || itvl > maxRetryIntervalSecs {
+					return fmt.Errorf("Global refused: retry_interval %q is not a number of seconds from 1 to %v", value, maxRetryIntervalSecs)
+				}
+				cfg.RetryInterval = time.Second * time.Duration(itvl)
+			case "encoding":
+				//Flexible encoding Not supported yet
+				cfg.Encoding = gpb.Encoding_JSON_IETF
+			case "unidirectional":
+				// No PublishResponse supported yet
+				cfg.Unidirectional = true
+			}
+		}
+		*clientCfg = cfg
+		// Apply changes to all running instances
+		for grpName := range destGrpNameMap {
+			closeDestGroupClient(grpName)
+			setupDestGroupClients(ctx, grpName)
+>>>>>>> 5ee58df (NOS-20765: [dialout] Validate a destination as host:port before dialling (#359))
 		}
 	} else if destGroupName, matched := matchRowPrefix(key, "DestinationGroup", separator); matched {
 		if destGroupName == "" {
 			return fmt.Errorf("Empty  Destination Group name %v", key)
 		}
-		// Close any client intances targeting this Destination group
-		closeDestGroupClient(destGroupName)
-		//DestGrp2ClientSubMap
+		if rowUpdated(op, fv) {
+			op = "hset"
+		}
 		if op == "hdel" {
-			if _, ok := DestGrp2ClientSubMap[destGroupName]; ok {
-				log.V(1).Infof("%v is being used: %v", destGroupName, DestGrp2ClientSubMap)
-				return fmt.Errorf("%v is being used: %v", destGroupName, DestGrp2ClientSubMap)
-			}
+			// The group's subscriptions stop and stay registered to it, as
+			// they would for a group that does not exist yet; a row with
+			// this name starts them again.
+			closeDestGroupClient(destGroupName)
 			delete(destGrpNameMap, destGroupName)
 			log.V(3).Infof("Deleted  DestinationGroup %v", destGroupName)
 			return nil
-		} else {
-			var dests []Destination
-			for field, value := range fv {
-				switch field {
-				case "dst_addr":
-					addrs := strings.Split(value, ",")
-					for _, addr := range addrs {
-						dst := Destination{Addrs: addr}
-						if err = dst.Validate(); err != nil {
-							log.V(2).Infof("Invalid destination address %v", addrs)
-							return fmt.Errorf("Invalid destination address %v", addrs)
-						}
-						dests = append(dests, Destination{Addrs: addr})
-					}
-				default:
-					log.V(2).Infof("Invalid DestinationGroup value %v", value)
-					return fmt.Errorf("Invalid DestinationGroup value %v", value)
-				}
-			}
-			destGrpNameMap[destGroupName] = dests
-			setupDestGroupClients(ctx, destGroupName)
 		}
+		// Check the whole row before touching the running clients: a row that
+		// is refused leaves the group, and the subscriptions dialling it, as
+		// they were.
+		var dests []Destination
+		for field, value := range fv {
+			switch field {
+			case "dst_addr":
+				for _, addr := range strings.Split(value, ",") {
+					dst := Destination{Addrs: addr}
+					if err := dst.Validate(); err != nil {
+						return fmt.Errorf("DestinationGroup %v refused: %v", destGroupName, err)
+					}
+					dests = append(dests, dst)
+				}
+			default:
+				return fmt.Errorf("Invalid DestinationGroup field %v value %v", field, value)
+			}
+		}
+		if len(dests) == 0 {
+			// The key was emptied or deleted between the event and the
+			// read; its delete follows. A subscription started on an empty
+			// list panics the dial-out client.
+			return fmt.Errorf("DestinationGroup %v refused: no dst_addr", destGroupName)
+		}
+		// Close any client instances targeting this Destination group, then
+		// re-dial them against the new list.
+		closeDestGroupClient(destGroupName)
+		destGrpNameMap[destGroupName] = dests
+		setupDestGroupClients(ctx, destGroupName)
 	} else if name, matched := matchRowPrefix(key, "Subscription", separator); matched {
 		if name == "" {
 			return fmt.Errorf("Empty Subscription name %v", key)
 		}
 		csub, ok := ClientSubscriptionNameMap[name]
-		if ok {
+		if rowUpdated(op, fv) {
+			op = "hset"
+		}
+		if op == "hdel" {
+			if !ok {
+				// A row that was refused or has no dst_group is not
+				// registered: there is nothing to stop.
+				log.V(2).Infof("Subscription %v is not registered, nothing to delete", name)
+				return nil
+			}
 			csub.Close()
 			csub.cancel()
-		}
-
-		if op == "hdel" {
-			destGrpName := csub.destGroupName
-			// Remove this ClientSubscrition from the list of the Destination group users
-			csNames := DestGrp2ClientSubMap[destGrpName]
-			for i, csName := range csNames {
-				if name == csName {
-					csNames = append(csNames[:i], csNames[i+1:]...)
-					break
-				}
-			}
-			DestGrp2ClientSubMap[destGrpName] = csNames
-			// Delete clientSubscription from name map
-			delete(ClientSubscriptionNameMap, name)
+			unregisterSubscription(csub)
 			log.V(3).Infof("Deleted  Client Subscription %v", name)
 			return nil
 		} else {
+<<<<<<< HEAD
 			// TODO: start one subscription publish routine for this request
 			// Only start routine when DestGrp2ClientSubMap is not empty, or ...?
+=======
+			// Parse the whole row before touching the running instance: a
+			// row that does not parse leaves the subscription running as
+			// it was. A row that parses but whose data source cannot be
+			// opened still replaces it; that failure is logged below.
+>>>>>>> 5ee58df (NOS-20765: [dialout] Validate a destination as host:port before dialling (#359))
 			cs := clientSubscription{
-				interval: 5000 * time.Millisecond, // default to 5000 milliseconds
-				name:     name,
-				cancel:   cancel,
+				interval:   5000 * time.Millisecond, // default to 5000 milliseconds
+				reportType: Periodic,
+				name:       name,
 			}
 			for field, value := range fv {
 				switch field {
 				case "dst_group":
 					cs.destGroupName = value
 				case "report_type":
+					// The publisher runs these two only; any other type
+					// would dial and never send.
 					cs.reportType = NewReportType(value)
+					if cs.reportType != Periodic && cs.reportType != Stream {
+						return fmt.Errorf("Subscription %v refused: report_type %q is not periodic or stream", name, value)
+					}
 				case "report_interval":
+					// At 0 a periodic subscription sends dumps without a pause.
 					intvl, err := strconv.ParseUint(value, 10, 64)
-					if err != nil {
-						log.V(2).Infof("Invalid report_interval %v %v", value, err)
-						continue
+					if err != nil || intvl == 0 || intvl > maxReportIntervalMs {
+						return fmt.Errorf("Subscription %v refused: report_interval %q is not a number of milliseconds from 1 to %v", name, value, maxReportIntervalMs)
 					}
 					cs.interval = time.Duration(intvl) * time.Millisecond
 				case "path_target":
@@ -637,26 +803,32 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 					return fmt.Errorf("Invalid field %v value %v", field, value)
 				}
 			}
+			if cs.prefix.GetTarget() == "" {
+				return fmt.Errorf("Subscription %v refused: no path_target", name)
+			}
 			log.V(2).Infof("New clientSubscription %v", cs)
+			if ok {
+				// The old instance leaves its group's user list too: the
+				// row may name another group now, or none.
+				csub.Close()
+				csub.cancel()
+				unregisterSubscription(csub)
+			}
 			if cs.destGroupName == "" {
 				// not destination configured, just return
 				return nil
 			}
 
-			var found bool
-			for _, na := range DestGrp2ClientSubMap[cs.destGroupName] {
-				if na == cs.name {
-					found = true
-					break
-				}
-			}
-			if !found {
-				// Add this clientSubscription to the user list of Destination group
-				DestGrp2ClientSubMap[cs.destGroupName] = append(DestGrp2ClientSubMap[cs.destGroupName], cs.name)
-			}
+			DestGrp2ClientSubMap[cs.destGroupName] = append(DestGrp2ClientSubMap[cs.destGroupName], cs.name)
+			instCtx, cancel := context.WithCancel(ctx)
+			cs.cancel = cancel
 			ClientSubscriptionNameMap[cs.name] = &cs
 			log.V(2).Infof("NewInstance with Subscription change for %s to %s", cs.name, cs.destGroupName)
-			cs.NewInstance(ctx)
+			if err := cs.NewInstance(instCtx); err != nil {
+				// The row stays registered: a group that does not exist
+				// yet starts it when its row arrives.
+				log.V(1).Infof("Subscription %v is registered but not started: %v", cs.name, err)
+			}
 		}
 	}
 	return nil
@@ -732,7 +904,7 @@ func DialOutRun(ctx context.Context, ccfg *ClientConfig) error {
 	}
 	for _, dbkey := range dbkeys {
 		dbkey = dbkey[len(dbkey_prefix):]
-		processTelemetryClientConfig(ctx, redisDb, dbkey, "hset")
+		applyTelemetryClientConfig(ctx, redisDb, dbkey, "hset")
 	}
 
 	for {
@@ -750,9 +922,9 @@ func DialOutRun(ctx context.Context, ccfg *ClientConfig) error {
 		subscr := msgi.(*redis.Message)
 		dbkey := subscr.Channel[prefixLen:]
 		if subscr.Payload == "del" || subscr.Payload == "hdel" {
-			processTelemetryClientConfig(ctx, redisDb, dbkey, "hdel")
+			applyTelemetryClientConfig(ctx, redisDb, dbkey, "hdel")
 		} else if subscr.Payload == "hset" {
-			processTelemetryClientConfig(ctx, redisDb, dbkey, "hset")
+			applyTelemetryClientConfig(ctx, redisDb, dbkey, "hset")
 		} else {
 			log.V(2).Infof("Invalid psubscribe payload notification:  %v", subscr)
 			continue
