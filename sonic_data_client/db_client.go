@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"reflect"
 	"strconv"
 	"strings"
@@ -201,6 +200,8 @@ type DbClient struct {
 	synced sync.WaitGroup  // Control when to send gNMI sync_response
 	w      *sync.WaitGroup // wait for all sub go routines to finish
 	mu     sync.RWMutex    // Mutex for data protection among routines for DbClient
+
+	keyspaceSub *keyspaceSubscriber
 
 	sendMsg int64
 	recvMsg int64
@@ -1447,40 +1448,31 @@ func dbFieldSubscribe(c *DbClient, gnmiPath *gnmipb.Path, onChange bool, interva
 
 type redisSubData struct {
 	tblPath   tablePath
-	pubsub    *redis.PubSub
+	reader    *keyspaceReader
 	prefixLen int
 }
 
 // TODO: For delete operation, the exact content returned is to be clarified.
-func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan map[string]interface{}) {
+// dbSingleTableKeySubscribe takes the run's stop channel and queue rather than reading
+// c.channel and c.q, which a later run of the client replaces while this routine may
+// still be stopping.
+func dbSingleTableKeySubscribe(rsd redisSubData, updateChannel chan map[string]interface{}, stop <-chan struct{}, q *queue.PriorityQueue) {
 	tblPath := rsd.tblPath
-	pubsub := rsd.pubsub
 	prefixLen := rsd.prefixLen
 	msi := make(map[string]interface{})
+	var err error
 
 	log.V(2).Infof("Starting dbSingleTableKeySubscribe routine for %+v", tblPath)
 
 	for {
 		select {
 		default:
-			msgi, err := pubsub.ReceiveTimeout(context.Background(), time.Millisecond*500)
-			if err != nil {
-				neterr, ok := err.(net.Error)
-				if ok {
-					if neterr.Timeout() == true {
-						continue
-					}
-				}
-
-				// Do not log errors if stop is signaled
-				if _, activeCh := <-c.channel; activeCh {
-					log.V(2).Infof("pubsub.ReceiveTimeout err %v", err)
-				}
-
-				continue
+			subscr, ok := rsd.reader.next(stop)
+			if !ok {
+				log.V(2).Infof("Stopping dbSingleTableKeySubscribe routine for %+v", tblPath)
+				return
 			}
 			newMsi := make(map[string]interface{})
-			subscr := msgi.(*redis.Message)
 
 			if subscr.Payload == "del" || subscr.Payload == "hdel" {
 				if tblPath.tableKey != "" {
@@ -1500,7 +1492,7 @@ func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan
 				if tblPath.tableKey != "" {
 					err = TableData2Msi(&tblPath, false, nil, &newMsi)
 					if err != nil {
-						enqueueFatalMsg(c, err.Error())
+						putFatalMsg(q, err.Error())
 						return
 					}
 				} else {
@@ -1512,7 +1504,7 @@ func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan
 					tblPath.tableKey = subscr.Channel[prefixLen:]
 					err = TableData2Msi(&tblPath, true, nil, &newMsi)
 					if err != nil {
-						enqueueFatalMsg(c, err.Error())
+						putFatalMsg(q, err.Error())
 						return
 					}
 				}
@@ -1527,14 +1519,30 @@ func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan
 			}
 
 			if len(newMsi) > 0 {
-				updateChannel <- newMsi
+				select {
+				case updateChannel <- newMsi:
+				case <-stop:
+					log.V(2).Infof("Stopping dbSingleTableKeySubscribe routine for %+v", tblPath)
+					return
+				}
 			}
 
-		case <-c.channel:
+		case <-stop:
 			log.V(2).Infof("Stopping dbSingleTableKeySubscribe routine for %+v", tblPath)
 			return
 		}
 	}
+}
+
+// keyspace returns the keyspace subscriber of the run that stop belongs to. A
+// client can run more than once, and each run's subscriber closes with its stop.
+func (c *DbClient) keyspace(stop <-chan struct{}) *keyspaceSubscriber {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.keyspaceSub == nil || c.keyspaceSub.stop != stop {
+		c.keyspaceSub = newKeyspaceSubscriber(stop)
+	}
+	return c.keyspaceSub
 }
 
 // dbTableKeySubscribe subscribes to tables using a table keys.
@@ -1542,6 +1550,8 @@ func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan
 // This function handles both ON_CHANGE and SAMPLE modes. "interval" being 0 is interpreted as ON_CHANGE mode.
 func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Duration, updateOnly bool) {
 	defer c.w.Done()
+	// A later run of the client replaces c.channel and c.q.
+	stop, q := c.channel, c.q
 
 	tblPaths := c.pathG2S[gnmiPath]
 	msiAll := make(map[string]interface{})
@@ -1559,7 +1569,7 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 	// Helper to handle fatal case.
 	handleFatalMsg := func(msg string) {
 		log.V(1).Infof("%s", msg)
-		enqueueFatalMsg(c, msg)
+		putFatalMsg(q, msg)
 		signalSync()
 	}
 
@@ -1577,13 +1587,14 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 			Timestamp: time.Now().UnixNano(),
 			Val:       val,
 		}
-		if err = c.q.Put(Value{spbv}); err != nil {
+		if err = q.Put(Value{spbv}); err != nil {
 			return fmt.Errorf("Queue error:  %v", err)
 		}
 
 		return nil
 	}
 
+	keyspace := c.keyspace(stop)
 	// Go through the paths and identify the tables to register.
 	for _, tblPath := range tblPaths {
 		// Subscribe to keyspace notification
@@ -1604,20 +1615,13 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 			pattern += "*"
 		}
 		redisDb := Target2RedisDb[tblPath.dbNamespace][tblPath.dbName]
-		pubsub := redisDb.PSubscribe(context.Background(), pattern)
-		defer pubsub.Close()
-
-		msgi, err := pubsub.ReceiveTimeout(context.Background(), time.Second)
+		reader, err := keyspace.subscribe(redisDb, pattern, time.Second)
 		if err != nil {
-			handleFatalMsg(fmt.Sprintf("psubscribe to %s failed for %v", pattern, tblPath))
+			handleFatalMsg(fmt.Sprintf("psubscribe to %s failed for %v: %v", pattern, tblPath, err))
 			return
 		}
-		subscr := msgi.(*redis.Subscription)
-		if subscr.Channel != pattern {
-			handleFatalMsg(fmt.Sprintf("psubscribe to %s failed for %v", pattern, tblPath))
-			return
-		}
-		log.V(2).Infof("Psubscribe succeeded for %v: %v", tblPath, subscr)
+		defer keyspace.unsubscribe(redisDb, pattern, reader)
+		log.V(2).Infof("Psubscribe succeeded for %v", tblPath)
 
 		err = TableData2Msi(&tblPath, false, nil, &msiAll)
 		if err != nil {
@@ -1626,7 +1630,7 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 		}
 		rsd := redisSubData{
 			tblPath:   tblPath,
-			pubsub:    pubsub,
+			reader:    reader,
 			prefixLen: prefixLen,
 		}
 		rsdList = append(rsdList, rsd)
@@ -1647,7 +1651,7 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 	// Start routines to listen on the table changes.
 	updateChannel := make(chan map[string]interface{})
 	for _, rsd := range rsdList {
-		go dbSingleTableKeySubscribe(c, rsd, updateChannel)
+		go dbSingleTableKeySubscribe(rsd, updateChannel, stop, q)
 	}
 
 	// Listen on updates from tables.
@@ -1690,7 +1694,7 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 			// Recreate the ticker for the next interval
 			intervalTicker = GetIntervalTicker()(interval)
 
-		case <-c.channel:
+		case <-stop:
 			log.V(1).Infof("Stopping dbTableKeySubscribe routine for %v ", c.pathG2S)
 			return
 		}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -2962,5 +2963,264 @@ func TestMixedDbClientOnceRun(t *testing.T) {
 		if q.Empty() {
 			t.Fatalf("expected fatal message in queue")
 		}
+	})
+}
+
+// psubscribeClients returns the ids of the redis connections holding pattern subscriptions.
+func psubscribeClients(t *testing.T, rclient *redis.Client) []string {
+	t.Helper()
+	list, err := rclient.ClientList(context.Background()).Result()
+	if err != nil {
+		t.Fatalf("CLIENT LIST failed: %v", err)
+	}
+	var ids []string
+	for _, line := range strings.Split(list, "\n") {
+		var id string
+		psub := false
+		for _, field := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(field, "id="); ok {
+				id = v
+			} else if v, ok := strings.CutPrefix(field, "psub="); ok && v != "0" {
+				psub = true
+			}
+		}
+		if psub {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func psubscribeConnections(t *testing.T, rclient *redis.Client) int {
+	t.Helper()
+	return len(psubscribeClients(t, rclient))
+}
+
+// enableKeyspaceEvents turns on the keyspace notifications that table-key subscriptions read.
+func enableKeyspaceEvents(t *testing.T, rclient *redis.Client) {
+	t.Helper()
+	if err := rclient.ConfigSet(context.Background(), "notify-keyspace-events", "KEA").Err(); err != nil {
+		t.Fatalf("enabling keyspace notifications failed: %v", err)
+	}
+}
+
+func TestTableKeySubscribeSharesOneRedisConnection(t *testing.T) {
+	mapkey := ":"
+	cleanup := setupMixedDbRedis(t, mapkey)
+	defer cleanup()
+	ns := ""
+	ctx := context.Background()
+	rclient := Target2RedisDb[ns]["COUNTERS_DB"]
+	enableKeyspaceEvents(t, rclient)
+
+	// 24 queue keys and one port key: one subscription over 25 keyspace patterns
+	queueKeys := make([]string, 24)
+	for i := range queueKeys {
+		queueKeys[i] = fmt.Sprintf("oid:0x15000000002%04x", i)
+		defer rclient.Del(ctx, "COUNTERS:"+queueKeys[i])
+	}
+	portKey := "oid:0x1000000002059"
+	defer rclient.Del(ctx, "COUNTERS:"+portKey)
+
+	tblPath := func(key string) tablePath {
+		return tablePath{dbNamespace: ns, dbName: "COUNTERS_DB", tableName: "COUNTERS", tableKey: key, delimitor: ":", jsonTableKey: key}
+	}
+	queuesPath := &gnmipb.Path{Elem: []*gnmipb.PathElem{{Name: "COUNTERS"}, {Name: "Ethernet0"}, {Name: "Queues"}}}
+	portPath := &gnmipb.Path{Elem: []*gnmipb.PathElem{{Name: "COUNTERS"}, {Name: "Ethernet0"}}}
+	pathG2S := map[*gnmipb.Path][]tablePath{portPath: {tblPath(portKey)}}
+	for _, key := range queueKeys {
+		pathG2S[queuesPath] = append(pathG2S[queuesPath], tblPath(key))
+	}
+	subscriptions := &gnmipb.SubscriptionList{Subscription: []*gnmipb.Subscription{
+		{Path: queuesPath, Mode: gnmipb.SubscriptionMode_SAMPLE, SampleInterval: uint64(time.Second)},
+		{Path: portPath, Mode: gnmipb.SubscriptionMode_ON_CHANGE},
+	}}
+
+	stream := func(t *testing.T, c Client, run int) {
+		for _, key := range queueKeys {
+			rclient.HSet(ctx, "COUNTERS:"+key, "SAI_QUEUE_STAT_PACKETS", "0")
+		}
+		rclient.HSet(ctx, "COUNTERS:"+portKey, "SAI_PORT_STAT_IF_IN_OCTETS", "0")
+		before := psubscribeConnections(t, rclient)
+
+		q := queue.NewPriorityQueue(1, false)
+		defer q.Dispose()
+		done := make(chan struct{})
+		defer close(done)
+		values := make(chan *spb.Value, 100)
+		go func() {
+			for {
+				items, err := q.Get(1)
+				if err != nil {
+					return
+				}
+				select {
+				case values <- items[0].(Value).Value:
+				case <-done:
+					return
+				}
+			}
+		}()
+		next := func(what string, want func(*spb.Value) bool) {
+			t.Helper()
+			timeout := time.After(5 * time.Second)
+			for {
+				select {
+				case v := <-values:
+					if want(v) {
+						return
+					}
+				case <-timeout:
+					t.Fatalf("run %d: no %s within 5s", run, what)
+				}
+			}
+		}
+		updateWith := func(path *gnmipb.Path, value string) func(*spb.Value) bool {
+			return func(v *spb.Value) bool {
+				return v.GetPath() == path && strings.Contains(string(v.GetVal().GetJsonIetfVal()), `"`+value+`"`)
+			}
+		}
+
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go c.StreamRun(q, stop, &wg, subscriptions)
+		next("sync response", func(v *spb.Value) bool { return v.GetSyncResponse() })
+
+		if got := psubscribeConnections(t, rclient) - before; got != 1 {
+			t.Errorf("run %d: the subscription holds %d pattern-subscribed redis connections, want 1", run, got)
+		}
+
+		queueValue := fmt.Sprintf("queue-run-%d", run)
+		rclient.HSet(ctx, "COUNTERS:"+queueKeys[len(queueKeys)-1], "SAI_QUEUE_STAT_PACKETS", queueValue)
+		next("SAMPLE update of the last queue key", updateWith(queuesPath, queueValue))
+		portValue := fmt.Sprintf("port-run-%d", run)
+		rclient.HSet(ctx, "COUNTERS:"+portKey, "SAI_PORT_STAT_IF_IN_OCTETS", portValue)
+		next("ON_CHANGE update of the port key", updateWith(portPath, portValue))
+
+		close(stop)
+		wg.Wait()
+		deadline := time.Now().Add(3 * time.Second)
+		for psubscribeConnections(t, rclient) != before {
+			if time.Now().After(deadline) {
+				t.Fatalf("run %d: %d pattern-subscribed redis connections remain after the subscription ended",
+					run, psubscribeConnections(t, rclient)-before)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	// Stream twice on each client: a client can run again after its previous run stops.
+	check := func(t *testing.T, c Client) {
+		for run := 1; run <= 2; run++ {
+			stream(t, c, run)
+		}
+	}
+
+	t.Run("DbClient", func(t *testing.T) {
+		check(t, &DbClient{pathG2S: pathG2S})
+	})
+	t.Run("MixedDbClient", func(t *testing.T) {
+		c := &MixedDbClient{mapkey: mapkey, encoding: gnmipb.Encoding_JSON_IETF}
+		patches := gomonkey.ApplyPrivateMethod(c, "getDbtablePath", func(_ *MixedDbClient, path *gnmipb.Path, _ *gnmipb.TypedValue) ([]tablePath, error) {
+			return pathG2S[path], nil
+		})
+		defer patches.Reset()
+		check(t, c)
+	})
+}
+
+func TestTableKeyReaderStopsWhileSending(t *testing.T) {
+	prefix := "__keyspace@4__:TEST:"
+	check := func(t *testing.T, read func(redisSubData, chan map[string]interface{}, <-chan struct{}, *queue.PriorityQueue)) {
+		r := &keyspaceReader{ready: make(chan struct{}, 1)}
+		r.push(&redis.Message{Channel: prefix + "a", Payload: "del"})
+		r.push(&redis.Message{Channel: prefix + "b", Payload: "del"})
+		rsd := redisSubData{tblPath: tablePath{tableName: "TEST", delimitor: ":"}, reader: r, prefixLen: len(prefix)}
+		updates := make(chan map[string]interface{})
+		stop := make(chan struct{})
+		q := queue.NewPriorityQueue(1, false)
+		defer q.Dispose()
+		done := make(chan struct{})
+		go func() {
+			read(rsd, updates, stop, q)
+			close(done)
+		}()
+
+		select {
+		case <-updates:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no update for the first key")
+		}
+		// nobody receives the second key's update, so the reader blocks sending it
+		time.Sleep(100 * time.Millisecond)
+		close(stop)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("the reader did not return after stop while it was sending an update")
+		}
+	}
+	t.Run("DbClient", func(t *testing.T) { check(t, dbSingleTableKeySubscribe) })
+	t.Run("MixedDbClient", func(t *testing.T) { check(t, (&MixedDbClient{}).dbSingleTableKeySubscribe) })
+}
+
+func TestTableKeySubscribeReportsPSubscribeFailure(t *testing.T) {
+	mapkey := ":"
+	cleanup := setupMixedDbRedis(t, mapkey)
+	defer cleanup()
+	key := "oid:0x1000000002059"
+	path := &gnmipb.Path{Elem: []*gnmipb.PathElem{{Name: "COUNTERS"}, {Name: "Ethernet0"}}}
+	pathG2S := map[*gnmipb.Path][]tablePath{path: {{dbNamespace: "", dbName: "COUNTERS_DB", tableName: "COUNTERS", tableKey: key, delimitor: ":", jsonTableKey: key}}}
+	subscriptions := &gnmipb.SubscriptionList{Subscription: []*gnmipb.Subscription{{Path: path, Mode: gnmipb.SubscriptionMode_ON_CHANGE}}}
+	pattern := keyspacePrefix() + "COUNTERS:" + key
+
+	check := func(t *testing.T, c Client) {
+		patches := gomonkey.ApplyMethod(reflect.TypeOf(&redis.PubSub{}), "PSubscribe", func(_ *redis.PubSub, _ context.Context, _ ...string) error {
+			return errors.New("psubscribe refused")
+		})
+		defer patches.Reset()
+
+		q := queue.NewPriorityQueue(1, false)
+		defer q.Dispose()
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go c.StreamRun(q, stop, &wg, subscriptions)
+		defer wg.Wait()
+		defer close(stop)
+
+		fatal := make(chan string, 1)
+		go func() {
+			for {
+				items, err := q.Get(1)
+				if err != nil {
+					return
+				}
+				if msg := items[0].(Value).GetFatal(); msg != "" {
+					fatal <- msg
+					return
+				}
+			}
+		}()
+		select {
+		case msg := <-fatal:
+			if !strings.Contains(msg, "psubscribe to "+pattern+" failed") || !strings.Contains(msg, "psubscribe refused") {
+				t.Errorf("the client got %q, want it to name the pattern %s and the PSUBSCRIBE error", msg, pattern)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("the client got no fatal error within 5s")
+		}
+	}
+
+	t.Run("DbClient", func(t *testing.T) {
+		check(t, &DbClient{pathG2S: pathG2S})
+	})
+	t.Run("MixedDbClient", func(t *testing.T) {
+		c := &MixedDbClient{mapkey: mapkey, encoding: gnmipb.Encoding_JSON_IETF}
+		patches := gomonkey.ApplyPrivateMethod(c, "getDbtablePath", func(_ *MixedDbClient, path *gnmipb.Path, _ *gnmipb.TypedValue) ([]tablePath, error) {
+			return pathG2S[path], nil
+		})
+		defer patches.Reset()
+		check(t, c)
 	})
 }
