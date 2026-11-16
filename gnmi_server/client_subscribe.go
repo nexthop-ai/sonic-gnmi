@@ -46,6 +46,24 @@ type Client struct {
 	w        sync.WaitGroup
 	fatal    bool
 	logLevel int
+<<<<<<< HEAD
+=======
+	// state is what this stream subscribed to, recorded from its first
+	// request. Its STATE_DB row is built from it (subscription_state.go).
+	// One Client is one Subscribe stream; a collector with several streams
+	// has several Clients.
+	state *subscriptionInfo
+	// statePub is the publisher of the server that created this Client, or nil
+	// when that server could not open one. Set before Run and not changed
+	// after.
+	statePub *statePublisher
+	// Byte counters the gRPC stats handler keeps for this stream; the
+	// publisher reads them on each tick for the row's byte counts.
+	bytes *substate.RPCBytes
+	// Why the stream ended, or why it was turned away before it ran.
+	endCause    string
+	rejectCause string
+>>>>>>> b34b60e (NOS-8352: [gnmi_server] lifetime totals and failure causes on the server row (#372))
 }
 
 // Syslog level for error
@@ -92,6 +110,13 @@ func (c *Client) setConnectionManager(threshold int) {
 	connectionManager.PrepareRedis()
 }
 
+// reject records why a parsed request is turned away before it runs, for
+// the rejection log line, and returns the error to send to the collector.
+func (c *Client) reject(cause string, err error) error {
+	c.rejectCause = cause
+	return err
+}
+
 // Key returns the client's key for use in the server's client map.
 // When EnableStreamMultiplexing is true, each stream has a unique StreamID.
 // When false, StreamID is 0 so all streams from the same peer share the same key (legacy behavior).
@@ -129,6 +154,15 @@ func (c *Client) populateDbPathSubscrition(sublist *gnmipb.SubscriptionList) ([]
 	return paths, nil
 }
 
+// runPhase is how far Run got, which decides what its deferred hook publishes.
+type runPhase int
+
+const (
+	phaseNone     runPhase = iota // no request parsed yet, or refused at the limit
+	phaseRejected                 // parsed, then turned away before it ran
+	phaseRunning
+)
+
 // Run starts the subscribe client. The first message received must be a
 // SubscriptionList. Once the client is started, it will run until the stream
 // is closed or the schedule completes. For Poll queries the Run will block
@@ -143,9 +177,24 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 		return grpc.Errorf(codes.FailedPrecondition, "cannot start client: stream is nil")
 	}
 
+<<<<<<< HEAD
 	defer func() {
 		if err != nil {
 			c.errors.Add(1)
+=======
+	c.bytes = substate.RPCBytesFrom(ctx)
+	pub := c.statePub
+	phase := phaseNone
+	defer func() {
+		if pub == nil {
+			return
+		}
+		switch phase {
+		case phaseRejected:
+			pub.onRejected(c.id, c.addr.String(), c.rejectCause)
+		case phaseRunning:
+			pub.onClose(c, endCauseFor(c.endCause, ctx.Err()))
+>>>>>>> b34b60e (NOS-8352: [gnmi_server] lifetime totals and failure causes on the server row (#372))
 		}
 	}()
 
@@ -157,6 +206,11 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 		}
 		return grpc.Errorf(grpc.Code(err), "received error from client")
 	}
+<<<<<<< HEAD
+=======
+	c.recvCount.Add(1)
+	phase = phaseRejected
+>>>>>>> b34b60e (NOS-8352: [gnmi_server] lifetime totals and failure causes on the server row (#372))
 
 	log.V(2).Infof("Client %s recieved initial query %v", c, query)
 
@@ -164,7 +218,7 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 	extensions := query.GetExtension()
 
 	if c.subscribe == nil {
-		return grpc.Errorf(codes.InvalidArgument, "first message must be SubscriptionList: %q", query)
+		return c.reject(rejectRequest, grpc.Errorf(codes.InvalidArgument, "first message must be SubscriptionList: %q", query))
 	}
 
 	prefix := c.subscribe.GetPrefix()
@@ -173,18 +227,26 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 
 	paths, err := c.populateDbPathSubscrition(c.subscribe)
 	if err != nil {
-		return grpc.Errorf(codes.NotFound, "Invalid subscription path: %v %q", err, query)
+		return c.reject(rejectPath, grpc.Errorf(codes.NotFound, "Invalid subscription path: %v %q", err, query))
 	}
 
 	if o, err := ParseOrigin(paths); err != nil {
-		return err // origin conflict within paths
+		return c.reject(rejectOrigin, err) // origin conflict within paths
 	} else if len(origin) == 0 {
 		origin = o // Use origin from paths if not given in prefix
 	} else if len(o) != 0 && o != origin {
-		return status.Error(codes.InvalidArgument, "Origin conflict between prefix and paths")
+		return c.reject(rejectOrigin, status.Error(codes.InvalidArgument, "Origin conflict between prefix and paths"))
 	}
 
+<<<<<<< HEAD
 	if connectionKey, valid = connectionManager.Add(c.addr, query.String()); !valid {
+=======
+	if connectionKey, valid = connectionManager.Add(c.addr, query.String(), c.id); !valid {
+		phase = phaseNone // counted on the spot by onRefused
+		if pub != nil {
+			pub.onRefused(c.id, c.addr.String())
+		}
+>>>>>>> b34b60e (NOS-8352: [gnmi_server] lifetime totals and failure causes on the server row (#372))
 		return grpc.Errorf(codes.Unavailable, "Server connections are at capacity.")
 	}
 
@@ -203,6 +265,7 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 		var targetDbName string
 		dc, err = sdc.NewMixedDbClient(paths, prefix, origin, gnmipb.Encoding_JSON_IETF, "", "", &targetDbName)
 		authTarget = "gnmi_" + targetDbName
+<<<<<<< HEAD
 	} else if len(origin) != 0 {
 		return grpc.Errorf(codes.Unimplemented, "Unsupported origin: %s", origin)
 	} else if target == "" {
@@ -216,6 +279,21 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 	} else if target == "SHOW" {
 		return grpc.Errorf(codes.Unimplemented, "SHOW does not support subscribe operations")
 	} else if (target == "EVENTS") && (mode == gnmipb.SubscriptionList_STREAM) {
+=======
+	case common_utils.RejectOrigin:
+		return c.reject(rejectUnsupported, grpc.Errorf(codes.Unimplemented, "Unsupported origin: %s", origin))
+	case common_utils.RejectEmptyTarget:
+		// Target based path identification applies when origin == "". As per
+		// the spec it should have been treated as "openconfig", but we take a
+		// deviation and stick to legacy logic for backward compatibility.
+		return c.reject(rejectUnsupported, grpc.Errorf(codes.Unimplemented, "Empty target data not supported"))
+	case common_utils.BackendHost:
+		dc, err = sdc.NewNonDbClient(paths, prefix)
+		authTarget = "gnmi_others"
+	case common_utils.RejectShow:
+		return c.reject(rejectUnsupported, grpc.Errorf(codes.Unimplemented, "SHOW does not support subscribe operations"))
+	case common_utils.BackendEvents:
+>>>>>>> b34b60e (NOS-8352: [gnmi_server] lifetime totals and failure causes on the server row (#372))
 		dc, err = sdc.NewEventClient(paths, prefix, c.logLevel)
 		authTarget = "gnmi_events"
 	} else if targetDbName, ok, _, _ := sdc.IsTargetDb(target); ok {
@@ -227,20 +305,20 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 	}
 
 	if err != nil {
-		return grpc.Errorf(codes.NotFound, "%v", err)
+		return c.reject(rejectSource, grpc.Errorf(codes.NotFound, "%v", err))
 	}
 
 	defer dc.Close()
 	ctx = stream.Context()
 	ctx, err = authenticate(config, ctx, authTarget, false)
 	if err != nil {
-		return err
+		return c.reject(rejectAuth, err)
 	}
 
 	// Checked after authenticate so unauthenticated callers get
 	// Unauthenticated instead of a policy result.
 	if err := checkPathsBlacklist(config.PathsBlacklist, prefix, paths); err != nil {
-		return err
+		return c.reject(rejectPolicy, err)
 	}
 
 	switch mode {
@@ -260,9 +338,18 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 		c.w.Add(1)
 		go dc.OnceRun(c.q, c.once, &c.w, c.subscribe)
 	default:
-		return grpc.Errorf(codes.InvalidArgument, "Unkown subscription mode: %q", query)
+		return c.reject(rejectMode, grpc.Errorf(codes.InvalidArgument, "Unkown subscription mode: %q", query))
 	}
 
+<<<<<<< HEAD
+=======
+	if pub != nil {
+		common_utils.GetUsername(ctx, &state.user)
+		c.state = state
+		pub.onAccept(c)
+	}
+	phase = phaseRunning
+>>>>>>> b34b60e (NOS-8352: [gnmi_server] lifetime totals and failure causes on the server row (#372))
 	log.V(1).Infof("Client %s running", c)
 	reauthStop := make(chan struct{})
 	reauthErr := make(chan error, 1)
@@ -274,6 +361,13 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 	err = c.send(stream, dc)
 	close(reauthStop)
 	c.Close()
+<<<<<<< HEAD
+=======
+	if err != nil && err.Error() == ConfigReloadRequested {
+		log.V(1).Infof("Client %s closed for a full config reload", c)
+		return grpc.Errorf(codes.Unavailable, "%s", err)
+	}
+>>>>>>> b34b60e (NOS-8352: [gnmi_server] lifetime totals and failure causes on the server row (#372))
 	// Wait until all child go routines exited
 	c.w.Wait()
 	select {
@@ -393,7 +487,12 @@ func (c *Client) send(stream gnmipb.GNMI_SubscribeServer, dc sdc.Client) error {
 			return err
 		}
 		if err != nil {
+<<<<<<< HEAD
 			c.errors.Add(1)
+=======
+			c.errorCount.Add(1)
+			c.endCause = causeSource
+>>>>>>> b34b60e (NOS-8352: [gnmi_server] lifetime totals and failure causes on the server row (#372))
 			log.V(1).Infof("%v", err)
 			return fmt.Errorf("unexpected queue Gext(1): %v", err)
 		}
@@ -401,9 +500,19 @@ func (c *Client) send(stream gnmipb.GNMI_SubscribeServer, dc sdc.Client) error {
 		var resp *gnmipb.SubscribeResponse
 
 		switch v := items[0].(type) {
+		case sdc.RequestFatal:
+			c.errorCount.Add(1)
+			c.endCause = causeRequest
+			_, err = sdc.ValToResp(v.Value)
+			return err
 		case sdc.Value:
 			if resp, err = sdc.ValToResp(v); err != nil {
+<<<<<<< HEAD
 				c.errors.Add(1)
+=======
+				c.errorCount.Add(1)
+				c.endCause = valueCause(v.GetFatal())
+>>>>>>> b34b60e (NOS-8352: [gnmi_server] lifetime totals and failure causes on the server row (#372))
 				return err
 			}
 			val = &v
@@ -416,7 +525,12 @@ func (c *Client) send(stream gnmipb.GNMI_SubscribeServer, dc sdc.Client) error {
 		err = stream.Send(resp)
 		if err != nil {
 			log.V(1).Infof("Client %s sending error:%v", c, err)
+<<<<<<< HEAD
 			c.errors.Add(1)
+=======
+			c.errorCount.Add(1)
+			c.endCause = substate.SendCause(err)
+>>>>>>> b34b60e (NOS-8352: [gnmi_server] lifetime totals and failure causes on the server row (#372))
 			dc.FailedSend()
 			return err
 		}

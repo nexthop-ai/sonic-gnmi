@@ -1961,7 +1961,7 @@ func (c *MixedDbClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w 
 				c.synced.Add(1)
 				go c.streamOnChangeSubscription(sub.GetPath())
 			} else {
-				putFatalMsg(c.q, fmt.Sprintf("unsupported subscription mode, %v", subMode))
+				putRequestFatal(c.q, fmt.Sprintf("unsupported subscription mode, %v", subMode))
 				return
 			}
 		}
@@ -2007,7 +2007,7 @@ func (c *MixedDbClient) streamOnChangeSubscription(gnmiPath *gnmipb.Path) {
 func (c *MixedDbClient) streamSampleSubscription(sub *gnmipb.Subscription, updateOnly bool) {
 	samplingInterval, err := validateSampleInterval(sub)
 	if err != nil {
-		putFatalMsg(c.q, err.Error())
+		putRequestFatal(c.q, err.Error())
 		c.synced.Done()
 		c.w.Done()
 		return

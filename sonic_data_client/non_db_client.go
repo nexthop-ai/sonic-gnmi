@@ -434,13 +434,13 @@ func (c *NonDbClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *s
 	for _, sub := range subscribe.GetSubscription() {
 		subMode := sub.GetMode()
 		if subMode != gnmipb.SubscriptionMode_SAMPLE {
-			putFatalMsg(c.q, fmt.Sprintf("Unsupported subscription mode: %v.", subMode))
+			putRequestFatal(c.q, fmt.Sprintf("Unsupported subscription mode: %v.", subMode))
 			return
 		}
 
 		interval, err := validateSampleInterval(sub)
 		if err != nil {
-			putFatalMsg(c.q, err.Error())
+			putRequestFatal(c.q, err.Error())
 			return
 		}
 

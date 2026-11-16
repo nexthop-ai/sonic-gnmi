@@ -3,6 +3,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Azure/sonic-mgmt-common/translib"
+	"github.com/Azure/sonic-mgmt-common/translib/tlerr"
 	"github.com/Workiva/go-datastructures/queue"
 	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
@@ -244,6 +246,20 @@ func enqueFatalMsgTranslib(c *TranslClient, msg string) {
 	})
 }
 
+// isRequestError reports whether a translib error is about the request
+// itself: a path or mode it does not support, an argument it rejects, a
+// path it does not know, or a client version outside the supported range.
+// Anything else, such as a database it could not open, is the switch failing
+// to serve the request.
+func isRequestError(err error) bool {
+	var notSupported tlerr.NotSupportedError
+	var invalidArgs tlerr.InvalidArgsError
+	var notFound tlerr.NotFoundError
+	var badVersion tlerr.TranslibUnsupportedClientVersion
+	return errors.As(err, &notSupported) || errors.As(err, &invalidArgs) ||
+		errors.As(err, &notFound) || errors.As(err, &badVersion)
+}
+
 func enqueueSyncMessage(c *TranslClient) {
 	m := &spb.Value{
 		Timestamp:    time.Now().UnixNano(),
@@ -332,7 +348,12 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 
 	subSupport, err := isSubscribeSupportedFunc(req)
 	if err != nil {
-		enqueFatalMsgTranslib(c, fmt.Sprintf("Subscribe operation failed with error =%v", err.Error()))
+		msg := fmt.Sprintf("Subscribe operation failed with error =%v", err.Error())
+		if isRequestError(err) {
+			putRequestFatal(c.q, msg)
+		} else {
+			enqueFatalMsgTranslib(c, msg)
+		}
 		return
 	}
 
@@ -366,14 +387,14 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 			if pInfo.IsOnChangeSupported {
 				subscribe_mode = gnmipb.SubscriptionMode_ON_CHANGE
 			} else {
-				enqueFatalMsgTranslib(c, fmt.Sprintf("ON_CHANGE Streaming mode invalid for %v", pathStr))
+				putRequestFatal(c.q, fmt.Sprintf("ON_CHANGE Streaming mode invalid for %v", pathStr))
 				close(subChan)
 				return
 			}
 		case gnmipb.SubscriptionMode_SAMPLE:
 			subscribe_mode = gnmipb.SubscriptionMode_SAMPLE
 		default:
-			enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid Subscription Mode %d", sub.Mode))
+			putRequestFatal(c.q, fmt.Sprintf("Invalid Subscription Mode %d", sub.Mode))
 			close(subChan)
 			return
 		}
@@ -383,7 +404,7 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 		}
 
 		if hb := sub.HeartbeatInterval; hb > 0 && hb < uint64(pInfo.MinInterval)*uint64(time.Second) {
-			enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid Heartbeat Interval %ds, minimum interval is %ds",
+			putRequestFatal(c.q, fmt.Sprintf("Invalid Heartbeat Interval %ds, minimum interval is %ds",
 				sub.HeartbeatInterval/uint64(time.Second), subSupport[i].MinInterval))
 			close(subChan)
 			return
@@ -396,7 +417,7 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 			if interval == 0 {
 				interval = minInterval
 			} else if interval < minInterval {
-				enqueFatalMsgTranslib(c, fmt.Sprintf("Invalid SampleInterval %ds, minimum interval is %ds", interval/int(time.Second), pInfo.MinInterval))
+				putRequestFatal(c.q, fmt.Sprintf("Invalid SampleInterval %ds, minimum interval is %ds", interval/int(time.Second), pInfo.MinInterval))
 				close(subChan)
 				return
 			}

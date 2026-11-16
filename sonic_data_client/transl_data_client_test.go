@@ -3,11 +3,14 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/Azure/sonic-mgmt-common/translib"
+	"github.com/Azure/sonic-mgmt-common/translib/tlerr"
 	"github.com/Workiva/go-datastructures/queue"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	gnmi_extpb "github.com/openconfig/gnmi/proto/gnmi_ext"
 	"github.com/openconfig/ygot/ygot"
+	spb "github.com/sonic-net/sonic-gnmi/proto"
 	"reflect"
 	"sync"
 	"testing"
@@ -130,6 +133,7 @@ func TestTranslClient_StreamRun_Parallel(t *testing.T) {
 		subscriptions     []*gnmipb.Subscription
 		isOnChangeSupport bool
 		preferredType     translib.NotificationType
+		wantRequestFatal  bool // the request is refused as the client's mistake
 	}{
 		{
 			name: "TargetDefined_Resolves_To_OnChange",
@@ -177,6 +181,7 @@ func TestTranslClient_StreamRun_Parallel(t *testing.T) {
 
 			isOnChangeSupport: false,
 			preferredType:     translib.OnChange,
+			wantRequestFatal:  true,
 		},
 		{
 			name: "SampleSupport",
@@ -241,6 +246,18 @@ func TestTranslClient_StreamRun_Parallel(t *testing.T) {
 
 			// Wait for StreamRun to finish
 			externalWg.Wait()
+			if tt.wantRequestFatal {
+				found := false
+				for q.Len() > 0 {
+					items, _ := q.Get(1)
+					if _, ok := items[0].(RequestFatal); ok {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("no RequestFatal queued")
+				}
+			}
 
 			t.Log("Function exited cleanly after processing parallel workers")
 		})
@@ -702,4 +719,91 @@ func TestTickerCleanup_Coverage(t *testing.T) {
 
 	// Test with nil map
 	tickerCleanup(nil)
+}
+
+func TestTranslClient_StreamRun_SubscribeCheckErrorKind(t *testing.T) {
+	oldSubSupport := isSubscribeSupportedFunc
+	defer func() { isSubscribeSupportedFunc = oldSubSupport }()
+
+	path1 := &gnmipb.Path{Elem: []*gnmipb.PathElem{{Name: "interfaces"}}}
+	uri1 := "/restconf/data/openconfig-interfaces:interfaces"
+
+	tests := []struct {
+		name        string
+		err         error
+		wantRequest bool
+	}{
+		{"not_supported", tlerr.NotSupported("ON_CHANGE not supported"), true},
+		{"invalid_args", tlerr.InvalidArgs("bad path"), true},
+		{"not_found", tlerr.NotFound("no such path"), true},
+		{"wrapped_not_supported", fmt.Errorf("check: %w", tlerr.NotSupported("x")), true},
+		{"unsupported_client_version", tlerr.TranslibUnsupportedClientVersion{ClientVersion: "9.0.0", ServerVersion: "1.0.0", ServerBaseVersion: "1.0.0"}, true},
+		{"db_cannot_open", tlerr.TranslibDBCannotOpen{}, false},
+		{"plain_error", errors.New("boom"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isSubscribeSupportedFunc = func(req translib.IsSubscribeRequest) ([]*translib.IsSubscribeResponse, error) {
+				return nil, tt.err
+			}
+			q := queue.NewPriorityQueue(10, false)
+			c := &TranslClient{
+				ctx:      context.Background(),
+				path2URI: map[*gnmipb.Path]string{path1: uri1},
+			}
+			subList := &gnmipb.SubscriptionList{
+				Subscription: []*gnmipb.Subscription{{Path: path1, Mode: gnmipb.SubscriptionMode_ON_CHANGE}},
+			}
+			wg := &sync.WaitGroup{}
+			wg.Add(1)
+			c.StreamRun(q, make(chan struct{}), wg, subList)
+
+			items, err := q.Get(1)
+			if err != nil || len(items) != 1 {
+				t.Fatalf("queue: got %v, %v", items, err)
+			}
+			switch v := items[0].(type) {
+			case RequestFatal:
+				if !tt.wantRequest {
+					t.Fatalf("got RequestFatal %q, want a plain Fatal Value", v.Fatal)
+				}
+			case Value:
+				if tt.wantRequest {
+					t.Fatalf("got plain Value %q, want RequestFatal", v.GetFatal())
+				}
+				if v.GetFatal() == "" {
+					t.Fatalf("Value has no Fatal: %v", v)
+				}
+			default:
+				t.Fatalf("unexpected item %T", items[0])
+			}
+		})
+	}
+}
+
+// A RequestFatal shares the priority queue with ordinary values, so the heap
+// compares the two types in both directions.
+func TestValueRequestFatalMixedQueue(t *testing.T) {
+	for _, fatalFirst := range []bool{true, false} {
+		q := queue.NewPriorityQueue(10, false)
+		value := Value{&spb.Value{Timestamp: 2}}
+		fatal := RequestFatal{Value{&spb.Value{Timestamp: 1, Fatal: "bad interval"}}}
+		if fatalFirst {
+			q.Put(fatal)
+			q.Put(value)
+		} else {
+			q.Put(value)
+			q.Put(fatal)
+		}
+		items, err := q.Get(2)
+		if err != nil || len(items) != 2 {
+			t.Fatalf("fatalFirst=%v: got %v, %v", fatalFirst, items, err)
+		}
+		if _, ok := items[0].(RequestFatal); !ok {
+			t.Errorf("fatalFirst=%v: first item %T, want the older RequestFatal", fatalFirst, items[0])
+		}
+		if _, ok := items[1].(Value); !ok {
+			t.Errorf("fatalFirst=%v: second item %T, want Value", fatalFirst, items[1])
+		}
+	}
 }

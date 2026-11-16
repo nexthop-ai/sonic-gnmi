@@ -173,9 +173,23 @@ type Value struct {
 	*spb.Value
 }
 
+// RequestFatal is a Fatal value a data client sends when, after the stream
+// has started, it finds the collector's request unusable: a subscription
+// mode or interval it does not serve, or a path its own check rejects. The
+// collector receives it as any Fatal; its type tells a mistake in the
+// request from a failure of the switch's data source.
+type RequestFatal struct {
+	Value
+}
+
+// timestamped is any queue item, compared by its timestamp.
+type timestamped interface {
+	GetTimestamp() int64
+}
+
 // Implement Compare method for priority queue
 func (val Value) Compare(other queue.Item) int {
-	oval := other.(Value)
+	oval := other.(timestamped)
 	if val.GetTimestamp() > oval.GetTimestamp() {
 		return 1
 	} else if val.GetTimestamp() == oval.GetTimestamp() {
@@ -289,7 +303,7 @@ func (c *DbClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *sync
 				c.synced.Add(1)
 				go streamOnChangeSubscription(c, sub.GetPath())
 			} else {
-				enqueueFatalMsg(c, fmt.Sprintf("unsupported subscription mode, %v", subMode))
+				putRequestFatal(c.q, fmt.Sprintf("unsupported subscription mode, %v", subMode))
 				return
 			}
 		}
@@ -332,7 +346,7 @@ func streamOnChangeSubscription(c *DbClient, gnmiPath *gnmipb.Path) {
 func streamSampleSubscription(c *DbClient, sub *gnmipb.Subscription, updateOnly bool) {
 	samplingInterval, err := validateSampleInterval(sub)
 	if err != nil {
-		enqueueFatalMsg(c, err.Error())
+		putRequestFatal(c.q, err.Error())
 		c.synced.Done()
 		c.w.Done()
 		return
@@ -1250,6 +1264,14 @@ func subscribeTableData2TypedValue(tblPaths []tablePath, op *string) (*gnmipb.Ty
 
 func enqueueFatalMsg(c *DbClient, msg string) {
 	putFatalMsg(c.q, msg)
+}
+
+// putRequestFatal ends the stream on a mistake in the collector's request.
+func putRequestFatal(q *queue.PriorityQueue, msg string) {
+	q.Put(RequestFatal{Value{&spb.Value{
+		Timestamp: time.Now().UnixNano(),
+		Fatal:     msg,
+	}}})
 }
 
 func putFatalMsg(q *queue.PriorityQueue, msg string) {
