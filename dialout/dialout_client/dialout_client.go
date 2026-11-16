@@ -445,6 +445,9 @@ func closeDestGroupClient(destGroupName string) {
 	if names, ok := DestGrp2ClientSubMap[destGroupName]; ok {
 		for _, name := range names {
 			cs := ClientSubscriptionNameMap[name]
+			if cs == nil {
+				continue
+			}
 			cs.Close()
 			cs.cancel()
 		}
