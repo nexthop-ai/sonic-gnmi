@@ -196,8 +196,30 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 
 	log.V(3).Infof("mode=%v, origin=%q, target=%q", mode, origin, target)
 
+<<<<<<< HEAD
 	authTarget := "gnmi"
 	if origin == "openconfig" {
+=======
+	// common_utils.ResolveBackend selects the backend; each arm below builds
+	// its client, and the path rows render paths for it.
+	backend := common_utils.ResolveBackend(origin, target, mode == gnmipb.SubscriptionList_STREAM)
+
+	// Record the request before a data client is built: a data client may
+	// change the request it is given, and the rows record the request as
+	// the collector sent it.
+	var state *subscriptionInfo
+	if pub != nil {
+		local := ""
+		if rb := substate.RPCBytesFrom(ctx); rb.Conn != nil {
+			local = rb.Conn.Local
+		}
+		state = newSubscriptionInfo(c.subscribe, origin, target, backend, c.addr.String(), local, received)
+	}
+
+	authTarget := "gnmi"
+	switch backend {
+	case common_utils.BackendYANG:
+>>>>>>> 9956435 (NOS-8352: [gnmi_server] path rows and the user on each subscription row (#369))
 		dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions, sdc.TranslWildcardOption{})
 	} else if IsNativeOrigin(origin) {
 		var targetDbName string
@@ -263,6 +285,14 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 		return grpc.Errorf(codes.InvalidArgument, "Unkown subscription mode: %q", query)
 	}
 
+<<<<<<< HEAD
+=======
+	if pub != nil {
+		common_utils.GetUsername(ctx, &state.user)
+		c.state = state
+		pub.onAccept(c)
+	}
+>>>>>>> 9956435 (NOS-8352: [gnmi_server] path rows and the user on each subscription row (#369))
 	log.V(1).Infof("Client %s running", c)
 	reauthStop := make(chan struct{})
 	reauthErr := make(chan error, 1)

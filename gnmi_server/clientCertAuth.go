@@ -139,6 +139,7 @@ func ClientCertAuthenAndAuthor(ctx context.Context, serviceConfigTableName strin
 		if err := PopulateAuthStructByCommonName(username, &rc.Auth, serviceConfigTableName); err != nil {
 			return ctx, err
 		}
+		rc.Auth.User = username // the verified certificate's common name
 	} else {
 		if err := PopulateAuthStruct(username, &rc.Auth, nil); err != nil {
 			glog.Infof("[%s] Failed to retrieve authentication information; %v", rc.ID, err)
