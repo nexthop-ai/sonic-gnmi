@@ -81,6 +81,17 @@ func (cm *ConnectionManager) Add(addr net.Addr, query string) (string, bool) {
 	return key, true
 }
 
+// Count is how many admission slots are taken, the number the threshold is
+// checked against. A nil manager has none.
+func (cm *ConnectionManager) Count() int {
+	if cm == nil {
+		return 0
+	}
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return len(cm.connections)
+}
+
 func (cm *ConnectionManager) Remove(key string) bool {
 	cm.mu.RLock() // reading
 	_, exists := cm.connections[key]

@@ -46,6 +46,21 @@ type Client struct {
 	w        sync.WaitGroup
 	fatal    bool
 	logLevel int
+<<<<<<< HEAD
+=======
+	// state is what this stream subscribed to, recorded from its first
+	// request. Its STATE_DB row is built from it (subscription_state.go).
+	// One Client is one Subscribe stream; a collector with several streams
+	// has several Clients.
+	state *subscriptionInfo
+	// statePub is the publisher of the server that created this Client, or nil
+	// when that server could not open one. Set before Run and not changed
+	// after.
+	statePub *statePublisher
+	// Byte counters the gRPC stats handler keeps for this stream; the
+	// publisher reads them on each tick for the row's byte counts.
+	bytes *substate.RPCBytes
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 }
 
 // Syslog level for error
@@ -82,14 +97,18 @@ func (c *Client) setConnectionManager(threshold int) {
 	connectionManagerMu.Lock()
 	defer connectionManagerMu.Unlock()
 
-	if connectionManager != nil && threshold == connectionManager.GetThreshold() {
-		return
+	if connectionManager == nil || threshold != connectionManager.GetThreshold() {
+		connectionManager = &ConnectionManager{
+			connections: make(map[string]struct{}),
+			threshold:   threshold,
+		}
+		connectionManager.PrepareRedis()
 	}
-	connectionManager = &ConnectionManager{
-		connections: make(map[string]struct{}),
-		threshold:   threshold,
+	// The server row's admitted count reads the manager without this
+	// lock, which PrepareRedis holds across Redis I/O.
+	if c.statePub != nil {
+		c.statePub.admission.Store(connectionManager)
 	}
-	connectionManager.PrepareRedis()
 }
 
 // Key returns the client's key for use in the server's client map.
@@ -143,6 +162,11 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 		return grpc.Errorf(codes.FailedPrecondition, "cannot start client: stream is nil")
 	}
 
+<<<<<<< HEAD
+=======
+	c.bytes = substate.RPCBytesFrom(ctx)
+	pub := c.statePub
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 	defer func() {
 		if err != nil {
 			c.errors.Add(1)
@@ -150,13 +174,17 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 	}()
 
 	query, err := stream.Recv()
+<<<<<<< HEAD
 	c.recvMsg.Add(1)
+=======
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 	if err != nil {
 		if err == io.EOF {
 			return grpc.Errorf(codes.Aborted, "stream EOF received before init")
 		}
 		return grpc.Errorf(grpc.Code(err), "received error from client")
 	}
+	c.recvCount.Add(1)
 
 	log.V(2).Infof("Client %s recieved initial query %v", c, query)
 
@@ -196,6 +224,25 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 
 	log.V(3).Infof("mode=%v, origin=%q, target=%q", mode, origin, target)
 
+<<<<<<< HEAD
+=======
+	// common_utils.ResolveBackend selects the backend; each arm below builds
+	// its client, and the path rows render paths for it.
+	backend := common_utils.ResolveBackend(origin, target, mode == gnmipb.SubscriptionList_STREAM)
+
+	// Record the request before a data client is built: a data client may
+	// change the request it is given, and the rows record the request as
+	// the collector sent it.
+	var state *subscriptionInfo
+	if pub != nil {
+		local := ""
+		if c.bytes.Conn != nil {
+			local = c.bytes.Conn.Local
+		}
+		state = newSubscriptionInfo(c.subscribe, origin, target, backend, c.addr.String(), local, received)
+	}
+
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 	authTarget := "gnmi"
 	if origin == "openconfig" {
 		dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions, sdc.TranslWildcardOption{})
@@ -347,8 +394,11 @@ func (c *Client) recv(stream gnmipb.GNMI_SubscribeServer) {
 	for {
 		log.V(5).Infof("Client %s blocking on stream.Recv()", c)
 		event, err := stream.Recv()
+<<<<<<< HEAD
 		c.recvMsg.Add(1)
 
+=======
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 		switch err {
 		default:
 			log.V(1).Infof("Client %s received error: %v", c, err)
@@ -366,6 +416,7 @@ func (c *Client) recv(stream gnmipb.GNMI_SubscribeServer) {
 			}
 			return
 		case nil:
+			c.recvCount.Add(1)
 		}
 
 		if c.subscribe.Mode == gnmipb.SubscriptionList_POLL {
@@ -412,7 +463,10 @@ func (c *Client) send(stream gnmipb.GNMI_SubscribeServer, dc sdc.Client) error {
 			c.errors.Add(1)
 		}
 
+<<<<<<< HEAD
 		c.sendMsg.Add(1)
+=======
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 		err = stream.Send(resp)
 		if err != nil {
 			log.V(1).Infof("Client %s sending error:%v", c, err)
@@ -420,6 +474,7 @@ func (c *Client) send(stream gnmipb.GNMI_SubscribeServer, dc sdc.Client) error {
 			dc.FailedSend()
 			return err
 		}
+		c.sendCount.Add(1) // a message sent, not an attempt
 
 		dc.SentOne(val)
 		log.V(5).Infof("Client %s done sending, msg count %d, msg %v", c, c.sendMsg.Load(), resp)

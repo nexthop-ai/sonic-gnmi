@@ -80,8 +80,13 @@ func TestClientSendCountersOnSendError(t *testing.T) {
 	if err == nil {
 		t.Fatal("send() returned nil, want send error")
 	}
+<<<<<<< HEAD
 	if got := client.sendMsg.Load(); got != 1 {
 		t.Errorf("sendMsg = %d, want 1", got)
+=======
+	if got := client.sendCount.Load(); got != 0 {
+		t.Errorf("sendCount = %d, want 0: only a successful send counts", got)
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 	}
 	if got := client.errors.Load(); got != 2 {
 		t.Errorf("errors = %d, want 2 (unknown queue item and failed send)", got)

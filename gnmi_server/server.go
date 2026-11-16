@@ -108,6 +108,15 @@ type Server struct {
 	gnsiAuthz         *GNSIAuthzServer
 	gnsiPathz         *GNSIPathzServer
 	ConnectionManager *ConnectionManager
+<<<<<<< HEAD
+=======
+	// statePub publishes this server's subscription rows and server row to
+	// STATE_DB, or is nil when it could not be opened. Set in NewServer,
+	// before any handler runs.
+	statePub      *statePublisher
+	stateName     string // the claimed state name, freed when the server stops
+	stateStopOnce sync.Once
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 	// DB Journals
 	configDbJournal *DbJournal
 	gnsiCredentialz *GNSICredentialzServer
@@ -587,6 +596,17 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 		}
 	}
 
+<<<<<<< HEAD
+=======
+	// The stats handler counts connections, which the server row shows,
+	// and attaches a byte counter to each Subscribe RPC's context. It is on
+	// commonOpts, so it counts the TCP and the Unix-socket listener alike.
+	// The publisher that writes the rows is opened last, once the server is
+	// known to be viable, so it adds no Redis round trip before the
+	// listeners.
+	stats := &substate.ServerStatsHandler{}
+	commonOpts = append(commonOpts, grpc.StatsHandler(stats))
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 	s := grpc.NewServer(commonOpts...)
 	reflection.Register(s)
 
@@ -709,10 +729,106 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 			return nil, fmt.Errorf("failed to create CONFIG_DB Journal: %v", err)
 		}
 	}
+<<<<<<< HEAD
+=======
+	srv.startStatePublisher(stateName, stats)
+	built = true
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 	log.V(1).Infof("Created Server on %s, read-only: %t", srv.Address(), !srv.config.EnableTranslibWrite)
 	return srv, nil
 }
 
+<<<<<<< HEAD
+=======
+// closeOnFailure frees what a failing NewServer opened: the listeners (a
+// Unix listener removes its own socket file) and the CONFIG_DB journal.
+func (srv *Server) closeOnFailure() {
+	if srv.lis != nil {
+		srv.lis.Close()
+	}
+	if srv.udsListener != nil {
+		srv.udsListener.Close()
+	}
+	if srv.configDbJournal != nil {
+		srv.configDbJournal.Close()
+	}
+}
+
+// stateNames holds the state names of the servers in this process, so two
+// servers never write the same rows.
+var stateNames = struct {
+	sync.Mutex
+	inUse map[string]bool
+}{inUse: map[string]bool{}}
+
+// claimStateName checks name and reserves it for a new server; empty means
+// "gnmi". A name already used by a live server in the process is refused,
+// and so is one substate.CheckServerName refuses.
+func claimStateName(name string) (string, error) {
+	if name == "" {
+		name = substate.ServerGNMI
+	}
+	if err := substate.CheckServerName(name); err != nil {
+		return "", err
+	}
+	stateNames.Lock()
+	defer stateNames.Unlock()
+	if stateNames.inUse[name] {
+		return "", fmt.Errorf("state name %q is already used by a live server in this process", name)
+	}
+	stateNames.inUse[name] = true
+	return name, nil
+}
+
+func releaseStateName(name string) {
+	stateNames.Lock()
+	delete(stateNames.inUse, name)
+	stateNames.Unlock()
+}
+
+// startStatePublisher opens this server's STATE_DB publisher under its claimed
+// name, for its server row and its subscription rows. Publishing is best
+// effort: if the publisher cannot be opened, the server runs without it. An
+// unreachable Redis does not disable it: the publisher is built without a
+// probe, and its writes fail until Redis is back.
+func (srv *Server) startStatePublisher(name string, stats *substate.ServerStatsHandler) {
+	srv.stateName = name
+	pub, err := newStatePublisher(name, srv.config.openStatePublisher, stats)
+	if err == nil && pub == nil {
+		err = fmt.Errorf("no publisher")
+	}
+	if err != nil {
+		log.Errorf("subscription state publishing disabled: %v", err)
+		return
+	}
+	var listen, unixSocket string
+	if srv.lis != nil {
+		listen = srv.lis.Addr().String()
+	}
+	if srv.udsListener != nil {
+		unixSocket = srv.udsListener.Addr().String()
+	}
+	// The VRF is a property of the TCP listener: a server with none, Unix
+	// socket only, or one whose TCP listener could not be created, has no VRF
+	// to report.
+	vrf := ""
+	if srv.lis != nil {
+		vrf = vrfName(srv.config.GnmiVrf)
+	}
+	pub.start(listen, unixSocket, vrf, srv.config.Threshold)
+	srv.statePub = pub
+}
+
+// vrfName is the VRF a TCP listener is bound to, as the server row
+// reports it: the configured name, or "default" when none is configured.
+func vrfName(configured string) string {
+	if configured == "" {
+		return "default"
+	}
+	return configured
+}
+
+>>>>>>> 688e211 (NOS-8352: [gnmi_server] server row GNMI_SERVER_STATE|gnmi and a periodic counter refresh (#371))
 // Serve will start the Server serving and block until closed.
 // If both TCP and UDS listeners are configured, both are served concurrently.
 // A failure in one listener does not affect the other; Serve blocks until all
