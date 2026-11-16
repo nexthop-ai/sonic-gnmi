@@ -713,6 +713,73 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 	return srv, nil
 }
 
+<<<<<<< HEAD
+=======
+// closeOnFailure frees what a failing NewServer opened: the listeners (a
+// Unix listener removes its own socket file) and the CONFIG_DB journal.
+func (srv *Server) closeOnFailure() {
+	if srv.lis != nil {
+		srv.lis.Close()
+	}
+	if srv.udsListener != nil {
+		srv.udsListener.Close()
+	}
+	if srv.configDbJournal != nil {
+		srv.configDbJournal.Close()
+	}
+}
+
+// stateNames holds the state names of the servers in this process, so two
+// servers never write the same rows.
+var stateNames = struct {
+	sync.Mutex
+	inUse map[string]bool
+}{inUse: map[string]bool{}}
+
+// claimStateName checks name and reserves it for a new server; empty means
+// "gnmi". A name already used by a live server in the process is refused,
+// and so is one substate.CheckServerName refuses.
+func claimStateName(name string) (string, error) {
+	if name == "" {
+		name = substate.ServerGNMI
+	}
+	if err := substate.CheckServerName(name); err != nil {
+		return "", err
+	}
+	stateNames.Lock()
+	defer stateNames.Unlock()
+	if stateNames.inUse[name] {
+		return "", fmt.Errorf("state name %q is already used by a live server in this process", name)
+	}
+	stateNames.inUse[name] = true
+	return name, nil
+}
+
+func releaseStateName(name string) {
+	stateNames.Lock()
+	delete(stateNames.inUse, name)
+	stateNames.Unlock()
+}
+
+// startStatePublisher opens this server's STATE_DB publisher under its claimed
+// name. Publishing is best effort: if the publisher cannot be opened, the
+// server runs without it. An unreachable Redis does not disable it: the
+// publisher is built without a probe, and its writes fail until Redis is back.
+func (srv *Server) startStatePublisher(name string) {
+	srv.stateName = name
+	pub, err := newStatePublisher(name, srv.config.openStatePublisher)
+	if err == nil && pub == nil {
+		err = fmt.Errorf("no publisher")
+	}
+	if err != nil {
+		log.Errorf("subscription state publishing disabled: %v", err)
+		return
+	}
+	pub.start()
+	srv.statePub = pub
+}
+
+>>>>>>> ea15ac5 (NOS-8352: [substate] clear a previous run's rows at start and this server's rows on a clean stop (#370))
 // Serve will start the Server serving and block until closed.
 // If both TCP and UDS listeners are configured, both are served concurrently.
 // A failure in one listener does not affect the other; Serve blocks until all
@@ -764,7 +831,10 @@ func (srv *Server) Serve() error {
 	return nil
 }
 
-// ForceStop stops the server immediately without waiting for connections to close.
+// ForceStop stops the server immediately without waiting for connections to
+// close. Its publisher still clears the rows it holds before it returns;
+// every Redis call has a 2 s timeout, so a hung Redis holds it a few seconds
+// at most.
 func (srv *Server) ForceStop() {
 	if srv.s != nil {
 		srv.s.Stop()
@@ -778,8 +848,26 @@ func (srv *Server) ForceStop() {
 	}
 }
 
+<<<<<<< HEAD
+=======
+// stopStatePublisher stops this server's publisher, which deletes the rows
+// it still holds, and then frees its state name, once. srv.statePub stays
+// set: ForceStop does not wait for running Subscribe handlers, so they may
+// still read it, and a stopped publisher refuses whatever they report.
+func (srv *Server) stopStatePublisher() {
+	srv.stateStopOnce.Do(func() {
+		if p := srv.statePub; p != nil {
+			p.pub.StopAndClear()
+		}
+		releaseStateName(srv.stateName)
+	})
+}
+
+>>>>>>> ea15ac5 (NOS-8352: [substate] clear a previous run's rows at start and this server's rows on a clean stop (#370))
 // Stop gracefully stops the server, waiting for active connections to close.
 func (srv *Server) Stop() {
+	// GracefulStop waits for the open streams, and the server still serves
+	// them meanwhile, so their rows stay until it returns.
 	if srv.s != nil {
 		srv.s.GracefulStop()
 	}
