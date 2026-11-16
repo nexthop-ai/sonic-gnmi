@@ -42,7 +42,7 @@ func TestTranslSubscribe(t *testing.T) {
 	t.Skip("Flaky due to hardcoded port 8081 conflict; port may still be in use from a prior test. Tracking: https://github.com/sonic-net/sonic-gnmi/issues/613")
 	s := createServer(t, 8081)
 	go runServer(t, s)
-	defer s.s.Stop()
+	defer s.ForceStop()
 
 	prepareDbTranslib(t)
 
@@ -942,7 +942,7 @@ func TestDebugSubscribePreferences(t *testing.T) {
 	t.Skip("Flaky due to hardcoded port 8081 conflict; port may still be in use from a prior test. Tracking: https://github.com/sonic-net/sonic-gnmi/issues/614")
 	s := createServer(t, 8081)
 	go runServer(t, s)
-	defer s.s.Stop()
+	defer s.ForceStop()
 
 	/*
 		ifTop := &spb_gnoi.SubscribePreference{

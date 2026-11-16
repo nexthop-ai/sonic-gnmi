@@ -31,6 +31,7 @@ import (
 	_ "github.com/sonic-net/sonic-gnmi/show_client"
 	sdc "github.com/sonic-net/sonic-gnmi/sonic_data_client"
 	ssc "github.com/sonic-net/sonic-gnmi/sonic_service_client"
+	"github.com/sonic-net/sonic-gnmi/substate"
 
 	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
@@ -108,6 +109,12 @@ type Server struct {
 	gnsiAuthz         *GNSIAuthzServer
 	gnsiPathz         *GNSIPathzServer
 	ConnectionManager *ConnectionManager
+	// statePub publishes this server's subscription rows to STATE_DB, or is
+	// nil when it could not be opened. Set in NewServer, before any handler
+	// runs.
+	statePub      *statePublisher
+	stateName     string // the claimed state name, freed when the server stops
+	stateStopOnce sync.Once
 	// DB Journals
 	configDbJournal *DbJournal
 	gnsiCredentialz *GNSICredentialzServer
@@ -232,6 +239,17 @@ type Config struct {
 	GnmiVrf             string
 	Vrf                 string
 	EnableCrl           bool
+	// StateName names this server's rows in STATE_DB: the server field of
+	// its subscription rows, and the prefix of its subscription ids when it
+	// is not the default. Empty means "gnmi". Servers that run at the same
+	// time in one process need different names.
+	StateName string
+	// openStatePublisher opens the state publisher; nil means substate.New.
+	// Set by tests.
+	openStatePublisher func(name string) (*substate.Publisher, error)
+	// newDbJournal builds the CONFIG_DB journal; nil means NewDbJournal. Set
+	// by tests.
+	newDbJournal func(string) (*DbJournal, error)
 	// Path to the directory where image is stored.
 	ImgDir     string
 	GetOptions func(*Config) ([]grpc.ServerOption, []certprovider.Provider, error)
@@ -561,6 +579,18 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 	if config == nil {
 		return nil, errors.New("config not provided")
 	}
+	// The state name is claimed before any listener or socket file is
+	// touched, so a server refused for a taken name changes nothing.
+	stateName, err := claimStateName(config.StateName)
+	if err != nil {
+		return nil, err
+	}
+	built := false
+	defer func() {
+		if !built {
+			releaseStateName(stateName)
+		}
+	}()
 	var providers []certprovider.Provider
 	if err := common_utils.ValidateSharedMemoryKey(); err != nil {
 		return nil, fmt.Errorf("invalid shared-memory configuration: %w", err)
@@ -587,6 +617,10 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 		}
 	}
 
+	// Records each Subscribe RPC's connection addresses, which its
+	// STATE_DB row shows. On commonOpts so the TCP and the Unix-socket
+	// servers both get it.
+	commonOpts = append(commonOpts, grpc.StatsHandler(&substate.ServerStatsHandler{}))
 	s := grpc.NewServer(commonOpts...)
 	reflection.Register(s)
 
@@ -634,7 +668,6 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 	credentialzSrv := NewGNSICredentialzServer(srv)
 	srv.gnsiCredentialz = credentialzSrv
 	orasSrv := &OrasServer{Server: srv}
-	var err error
 
 	// TCP Server: Enable if Port > 0, or Port == 0 when UnixSocket is not set
 	if tcpEnabled {
@@ -702,15 +735,85 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 	if srv.lis == nil && srv.udsListener == nil {
 		return nil, errors.New("no listener configured: port must be >= 0 or unix_socket must be set")
 	}
-
 	if *enableConfigDbJournal {
-		srv.configDbJournal, err = NewDbJournal("CONFIG_DB")
+		newJournal := NewDbJournal
+		if config.newDbJournal != nil {
+			newJournal = config.newDbJournal
+		}
+		srv.configDbJournal, err = newJournal("CONFIG_DB")
 		if err != nil {
+			srv.closeOnFailure()
 			return nil, fmt.Errorf("failed to create CONFIG_DB Journal: %v", err)
 		}
 	}
+	srv.startStatePublisher(stateName)
+	built = true
 	log.V(1).Infof("Created Server on %s, read-only: %t", srv.Address(), !srv.config.EnableTranslibWrite)
 	return srv, nil
+}
+
+// closeOnFailure frees what a failing NewServer opened: the listeners (a
+// Unix listener removes its own socket file) and the CONFIG_DB journal.
+func (srv *Server) closeOnFailure() {
+	if srv.lis != nil {
+		srv.lis.Close()
+	}
+	if srv.udsListener != nil {
+		srv.udsListener.Close()
+	}
+	if srv.configDbJournal != nil {
+		srv.configDbJournal.Close()
+	}
+}
+
+// stateNames holds the state names of the servers in this process, so two
+// servers never write the same rows.
+var stateNames = struct {
+	sync.Mutex
+	inUse map[string]bool
+}{inUse: map[string]bool{}}
+
+// claimStateName checks name and reserves it for a new server; empty means
+// "gnmi". A name already used by a live server in the process is refused,
+// and so is one substate.CheckServerName refuses.
+func claimStateName(name string) (string, error) {
+	if name == "" {
+		name = substate.ServerGNMI
+	}
+	if err := substate.CheckServerName(name); err != nil {
+		return "", err
+	}
+	stateNames.Lock()
+	defer stateNames.Unlock()
+	if stateNames.inUse[name] {
+		return "", fmt.Errorf("state name %q is already used by a live server in this process", name)
+	}
+	stateNames.inUse[name] = true
+	return name, nil
+}
+
+func releaseStateName(name string) {
+	stateNames.Lock()
+	delete(stateNames.inUse, name)
+	stateNames.Unlock()
+}
+
+// startStatePublisher opens this server's STATE_DB publisher under its claimed
+// name. Publishing is best effort: if the publisher cannot be opened, the
+// server runs without it. An unreachable Redis does not disable it: the
+// publisher is built without a probe, and its writes fail until Redis is back.
+func (srv *Server) startStatePublisher(name string) {
+	srv.stateName = name
+	pub, err := newStatePublisher(name, srv.config.openStatePublisher)
+	if err == nil && pub == nil {
+		err = fmt.Errorf("no publisher")
+	}
+	if err != nil {
+		log.Errorf("subscription state publishing disabled: %v", err)
+		return
+	}
+	pub.pub.Start()
+	srv.statePub = pub
 }
 
 // Serve will start the Server serving and block until closed.
@@ -772,10 +875,24 @@ func (srv *Server) ForceStop() {
 	if srv.udsServer != nil {
 		srv.udsServer.Stop()
 	}
+	srv.stopStatePublisher()
 	// Cleanup UDS socket file
 	if srv.config != nil && srv.config.UnixSocket != "" {
 		os.Remove(srv.config.UnixSocket)
 	}
+}
+
+// stopStatePublisher stops this server's publisher and frees its state
+// name, once. srv.statePub stays set: ForceStop does not wait for running
+// Subscribe handlers, which may still read it, and a stopped publisher
+// refuses whatever they report.
+func (srv *Server) stopStatePublisher() {
+	srv.stateStopOnce.Do(func() {
+		if srv.statePub != nil {
+			srv.statePub.pub.Stop()
+		}
+		releaseStateName(srv.stateName)
+	})
 }
 
 // Stop gracefully stops the server, waiting for active connections to close.
@@ -786,6 +903,7 @@ func (srv *Server) Stop() {
 	if srv.udsServer != nil {
 		srv.udsServer.GracefulStop()
 	}
+	srv.stopStatePublisher()
 	// Cleanup UDS socket file
 	if srv.config != nil && srv.config.UnixSocket != "" {
 		os.Remove(srv.config.UnixSocket)
@@ -931,7 +1049,11 @@ func (s *Server) Subscribe(stream gnmipb.GNMI_SubscribeServer) error {
 	*/
 
 	c := NewClient(pr.Addr)
+<<<<<<< HEAD
 	c.enableStreamMultiplexing = s.config.EnableStreamMultiplexing
+=======
+	c.statePub = s.statePub // nil when this server could not open one
+>>>>>>> b3b4ae2 (NOS-8352: [substate] publish one row per dial-in subscription to STATE_DB (#406))
 
 	c.setLogLevel(s.config.LogLevel)
 	c.setConnectionManager(s.config.Threshold)

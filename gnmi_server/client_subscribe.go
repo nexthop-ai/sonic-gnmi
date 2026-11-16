@@ -6,6 +6,7 @@ import (
 	log "github.com/golang/glog"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	sdc "github.com/sonic-net/sonic-gnmi/sonic_data_client"
+	"github.com/sonic-net/sonic-gnmi/substate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -27,6 +28,7 @@ type ClientKey struct {
 
 // Client contains information about a subscribe client that has connected to the server.
 type Client struct {
+<<<<<<< HEAD
 	addr                     net.Addr
 	id                       uint64 // Unique ID for this client instance
 	enableStreamMultiplexing bool   // When true, include unique stream ID in Key() for multiplexing
@@ -42,10 +44,32 @@ type Client struct {
 	closed                   bool
 	q                        *queue.PriorityQueue
 	subscribe                *gnmipb.SubscriptionList
+=======
+	addr       net.Addr
+	id         uint64 // Unique ID for this client instance
+	sendCount  atomic.Int64
+	recvCount  atomic.Int64
+	errorCount atomic.Int64
+	polled     chan struct{}
+	stop       chan struct{}
+	once       chan struct{}
+	mu         sync.RWMutex
+	q          *queue.PriorityQueue
+	subscribe  *gnmipb.SubscriptionList
+>>>>>>> b3b4ae2 (NOS-8352: [substate] publish one row per dial-in subscription to STATE_DB (#406))
 	// Wait for all sub go routine to finish
 	w        sync.WaitGroup
 	fatal    bool
 	logLevel int
+	// state is what this stream subscribed to, recorded from its first
+	// request. Its STATE_DB row is built from it (subscription_state.go).
+	// One Client is one Subscribe stream; a collector with several streams
+	// has several Clients.
+	state *subscriptionInfo
+	// statePub is the publisher of the server that created this Client, or nil
+	// when that server could not open one. Set before Run and not changed
+	// after.
+	statePub *statePublisher
 }
 
 // Syslog level for error
@@ -143,14 +167,17 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 		return grpc.Errorf(codes.FailedPrecondition, "cannot start client: stream is nil")
 	}
 
+	pub := c.statePub
 	defer func() {
-		if err != nil {
-			c.errors.Add(1)
+		// c.state is set only when the subscription is accepted and its
+		// row is written, so nil means there is no row to delete.
+		if pub != nil && c.state != nil {
+			pub.onClose(c)
 		}
 	}()
 
 	query, err := stream.Recv()
-	c.recvMsg.Add(1)
+	c.recvCount.Add(1)
 	if err != nil {
 		if err == io.EOF {
 			return grpc.Errorf(codes.Aborted, "stream EOF received before init")
@@ -158,6 +185,7 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 		return grpc.Errorf(grpc.Code(err), "received error from client")
 	}
 
+	received := time.Now()
 	log.V(2).Infof("Client %s recieved initial query %v", c, query)
 
 	c.subscribe = query.GetSubscribe()
@@ -195,6 +223,18 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 	mode := c.subscribe.GetMode()
 
 	log.V(3).Infof("mode=%v, origin=%q, target=%q", mode, origin, target)
+
+	// Record the request before a data client is built: a data client may
+	// change the request it is given, and the row records the request as
+	// the collector sent it.
+	var state *subscriptionInfo
+	if pub != nil {
+		local := ""
+		if rb := substate.RPCBytesFrom(ctx); rb.Conn != nil {
+			local = rb.Conn.Local
+		}
+		state = newSubscriptionInfo(c.subscribe, origin, target, c.addr.String(), local, received)
+	}
 
 	authTarget := "gnmi"
 	if origin == "openconfig" {
@@ -263,6 +303,10 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 		return grpc.Errorf(codes.InvalidArgument, "Unkown subscription mode: %q", query)
 	}
 
+	if pub != nil {
+		c.state = state
+		pub.onAccept(c)
+	}
 	log.V(1).Infof("Client %s running", c)
 	reauthStop := make(chan struct{})
 	reauthErr := make(chan error, 1)
@@ -293,12 +337,16 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+<<<<<<< HEAD
 	log.V(1).Infof("Client %s Close, sendMsg %v recvMsg %v errors %v", c,
 		c.sendMsg.Load(), c.recvMsg.Load(), c.errors.Load())
 	if c.closed {
 		return
 	}
 	c.closed = true
+=======
+	log.V(1).Infof("Client %s Close, sendCount %v recvCount %v errorCount %v", c, c.sendCount.Load(), c.recvCount.Load(), c.errorCount.Load())
+>>>>>>> b3b4ae2 (NOS-8352: [substate] publish one row per dial-in subscription to STATE_DB (#406))
 	if c.q != nil {
 		if !c.q.Disposed() {
 			c.q.Dispose()
@@ -347,7 +395,7 @@ func (c *Client) recv(stream gnmipb.GNMI_SubscribeServer) {
 	for {
 		log.V(5).Infof("Client %s blocking on stream.Recv()", c)
 		event, err := stream.Recv()
-		c.recvMsg.Add(1)
+		c.recvCount.Add(1)
 
 		switch err {
 		default:
@@ -393,7 +441,7 @@ func (c *Client) send(stream gnmipb.GNMI_SubscribeServer, dc sdc.Client) error {
 			return err
 		}
 		if err != nil {
-			c.errors.Add(1)
+			c.errorCount.Add(1)
 			log.V(1).Infof("%v", err)
 			return fmt.Errorf("unexpected queue Gext(1): %v", err)
 		}
@@ -403,25 +451,25 @@ func (c *Client) send(stream gnmipb.GNMI_SubscribeServer, dc sdc.Client) error {
 		switch v := items[0].(type) {
 		case sdc.Value:
 			if resp, err = sdc.ValToResp(v); err != nil {
-				c.errors.Add(1)
+				c.errorCount.Add(1)
 				return err
 			}
 			val = &v
 		default:
 			log.V(1).Infof("Unknown data type %v for %s in queue", items[0], c)
-			c.errors.Add(1)
+			c.errorCount.Add(1)
 		}
 
-		c.sendMsg.Add(1)
+		c.sendCount.Add(1)
 		err = stream.Send(resp)
 		if err != nil {
 			log.V(1).Infof("Client %s sending error:%v", c, err)
-			c.errors.Add(1)
+			c.errorCount.Add(1)
 			dc.FailedSend()
 			return err
 		}
 
 		dc.SentOne(val)
-		log.V(5).Infof("Client %s done sending, msg count %d, msg %v", c, c.sendMsg.Load(), resp)
+		log.V(5).Infof("Client %s done sending, msg count %d, msg %v", c, c.sendCount.Load(), resp)
 	}
 }

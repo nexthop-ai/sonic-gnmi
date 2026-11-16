@@ -80,10 +80,10 @@ func TestClientSendCountersOnSendError(t *testing.T) {
 	if err == nil {
 		t.Fatal("send() returned nil, want send error")
 	}
-	if got := client.sendMsg.Load(); got != 1 {
-		t.Errorf("sendMsg = %d, want 1", got)
+	if got := client.sendCount.Load(); got != 1 {
+		t.Errorf("sendCount = %d, want 1", got)
 	}
-	if got := client.errors.Load(); got != 2 {
-		t.Errorf("errors = %d, want 2 (unknown queue item and failed send)", got)
+	if got := client.errorCount.Load(); got != 2 {
+		t.Errorf("errorCount = %d, want 2 (unknown queue item and failed send)", got)
 	}
 }

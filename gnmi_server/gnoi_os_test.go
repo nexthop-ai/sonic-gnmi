@@ -714,7 +714,7 @@ func applyFullStreamSuccessPatch(t *testing.T) *gomonkey.Patches {
 func TestOSServer(t *testing.T) {
 	s := createServer(t, 8081)
 	go runServer(t, s)
-	defer s.s.Stop()
+	defer s.ForceStop()
 	targetAddr := "127.0.0.1:8081"
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))}

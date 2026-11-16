@@ -14,7 +14,7 @@ func TestDummyClearNeighbor(t *testing.T) {
 	// Start server
 	s := createServer(t, 8081)
 	go runServer(t, s)
-	defer s.s.Stop()
+	defer s.ForceStop()
 
 	// Run Client
 	client := createClient(t, 8081)
@@ -31,7 +31,7 @@ func TestDummyCopyConfig(t *testing.T) {
 	// Start server
 	s := createServer(t, 8081)
 	go runServer(t, s)
-	defer s.s.Stop()
+	defer s.ForceStop()
 
 	// Run Client
 	client := createClient(t, 8081)

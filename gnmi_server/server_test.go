@@ -145,18 +145,26 @@ func createServer(t *testing.T, port int64) *Server {
 	}
 
 	tlsOpts := []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsCfg))}
-	cfg := &Config{
+	s, err := NewServer(testServerConfig(port), tlsOpts, nil)
+	if err != nil {
+		t.Fatalf("Failed to create gNMI server: %v", err)
+	}
+	// Stopped even when the test fails before its own stop: a server left
+	// running would keep its state name, and every later NewServer in the
+	// run would be refused.
+	t.Cleanup(func() { s.ForceStop() })
+	return s
+}
+
+// testServerConfig is the configuration createServer serves with.
+func testServerConfig(port int64) *Config {
+	return &Config{
 		Port:                port,
 		EnableTranslibWrite: true,
 		EnableNativeWrite:   true,
 		Threshold:           100,
 		ImgDir:              "/tmp",
 	}
-	s, err := NewServer(cfg, tlsOpts, nil)
-	if err != nil {
-		t.Errorf("Failed to create gNMI server: %v", err)
-	}
-	return s
 }
 
 func createMTLSServer(t *testing.T, caCert string) *Server {
@@ -4690,6 +4698,7 @@ func TestCapabilities(t *testing.T) {
 	//t.Log("Start server")
 	s := createServer(t, 8085)
 	go runServer(t, s)
+	defer s.ForceStop()
 
 	// prepareDb(t)
 
