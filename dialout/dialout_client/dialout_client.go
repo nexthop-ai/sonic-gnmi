@@ -227,6 +227,18 @@ func (cs *clientSubscription) send(stream spb.GNMIDialOut_PublishClient) error {
 
 		var resp *gpb.SubscribeResponse
 		switch v := items[0].(type) {
+<<<<<<< HEAD
+=======
+		case sdc.RequestFatal:
+			// A data client queues this when an entry in the subscription list
+			// is one it cannot serve, such as an unsupported mode or interval.
+			// Dial-out passes no subscription list, so it never gets one today;
+			// this case ends the stream instead of sending an empty message if
+			// that changes.
+			cs.errors.Add(1)
+			_, err = sdc.ValToResp(v.Value)
+			return err
+>>>>>>> c556241 (NOS-23563: [dialout_client] Fix the master build, count a RequestFatal with errors.Add (#422))
 		case sdc.Value:
 			if resp, err = sdc.ValToResp(v); err != nil {
 				cs.errors++
