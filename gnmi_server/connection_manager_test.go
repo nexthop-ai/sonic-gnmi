@@ -2,6 +2,12 @@ package gnmi
 
 import (
 	"errors"
+<<<<<<< HEAD
+=======
+	"net"
+	"sync"
+	"sync/atomic"
+>>>>>>> 7af1d8a (NOS-23424: [gnmi_server] Check the subscription threshold and count the stream under one lock (#404))
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
@@ -49,3 +55,77 @@ func TestPrepareRedisReturnsWhenOptionsAreUnavailable(t *testing.T) {
 		})
 	}
 }
+<<<<<<< HEAD
+=======
+
+func TestConnectionManagerKeysStreamsOnOneConnectionSeparately(t *testing.T) {
+	previousClient := rclient
+	rclient = nil
+	defer func() {
+		rclient = previousClient
+	}()
+
+	cm := &ConnectionManager{connections: map[string]struct{}{}, threshold: 2}
+	addr := &net.TCPAddr{IP: net.ParseIP("10.0.0.5"), Port: 41234}
+	query := `subscription:{path:{target:"STATE_DB"}}`
+
+	keyA, ok := cm.Add(addr, query, 1)
+	if !ok {
+		t.Fatal("Add for stream 1 rejected")
+	}
+	keyB, ok := cm.Add(addr, query, 2)
+	if !ok {
+		t.Fatal("Add for stream 2 rejected")
+	}
+	if keyA == keyB {
+		t.Fatalf("streams 1 and 2 share key %q", keyA)
+	}
+	if _, ok := cm.Add(addr, query, 3); ok {
+		t.Error("Add for stream 3 accepted, want threshold 2 to count both live streams")
+	}
+
+	cm.Remove(keyA)
+	if _, ok := cm.connections[keyB]; !ok {
+		t.Errorf("removing stream 1 dropped stream 2's key %q", keyB)
+	}
+	if len(cm.connections) != 1 {
+		t.Errorf("got %d tracked streams after removing one, want 1", len(cm.connections))
+	}
+}
+
+// Streams that open at the same time are admitted up to the threshold and
+// no further: the check and the insert must not let them all pass the check
+// before any of them is counted.
+func TestConnectionManagerThresholdUnderConcurrentAdds(t *testing.T) {
+	previousClient := rclient
+	rclient = nil
+	defer func() {
+		rclient = previousClient
+	}()
+
+	const threshold = 4
+	addr := &net.TCPAddr{IP: net.ParseIP("10.0.0.5"), Port: 41234}
+	query := `subscription:{path:{target:"STATE_DB"}}`
+	for round := 0; round < 50; round++ {
+		cm := &ConnectionManager{connections: map[string]struct{}{}, threshold: threshold}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var admitted atomic.Int32
+		for i := 0; i < 32; i++ {
+			wg.Add(1)
+			go func(id uint64) {
+				defer wg.Done()
+				<-start
+				if _, ok := cm.Add(addr, query, id); ok {
+					admitted.Add(1)
+				}
+			}(uint64(i + 1))
+		}
+		close(start)
+		wg.Wait()
+		if n := admitted.Load(); n != threshold || len(cm.connections) != threshold {
+			t.Fatalf("round %d: %d streams admitted, %d tracked, want %d of each", round, n, len(cm.connections), threshold)
+		}
+	}
+}
+>>>>>>> 7af1d8a (NOS-23424: [gnmi_server] Check the subscription threshold and count the stream under one lock (#404))

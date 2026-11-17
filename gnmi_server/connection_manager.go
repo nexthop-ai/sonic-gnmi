@@ -64,19 +64,31 @@ func (cm *ConnectionManager) PrepareRedis() {
 	}
 }
 
+<<<<<<< HEAD
 func (cm *ConnectionManager) Add(addr net.Addr, query string) (string, bool) {
 	cm.mu.RLock()                                                 // reading
+=======
+func (cm *ConnectionManager) Add(addr net.Addr, query string, streamID uint64) (string, bool) {
+	key := createKey(addr, query, streamID)
+	// The check and the insert hold one lock, so concurrent streams cannot
+	// all pass the check before any of them is counted.
+	cm.mu.Lock()
+>>>>>>> 7af1d8a (NOS-23424: [gnmi_server] Check the subscription threshold and count the stream under one lock (#404))
 	if len(cm.connections) >= cm.threshold && cm.threshold != 0 { // 0 is defined as no threshold
+		cm.mu.Unlock()
 		log.V(1).Infof("Cannot add another client connection as threshold is already at limit")
-		cm.mu.RUnlock()
 		return "", false
 	}
+<<<<<<< HEAD
 	cm.mu.RUnlock()
 	key := createKey(addr, query)
 	log.V(1).Infof("Adding client connection: %s", key)
 	cm.mu.Lock() // writing
+=======
+>>>>>>> 7af1d8a (NOS-23424: [gnmi_server] Check the subscription threshold and count the stream under one lock (#404))
 	cm.connections[key] = struct{}{}
 	cm.mu.Unlock()
+	log.V(1).Infof("Adding client connection: %s", key)
 	storeKeyRedis(key)
 	return key, true
 }
