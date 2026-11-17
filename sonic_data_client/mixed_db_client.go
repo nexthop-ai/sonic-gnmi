@@ -2167,6 +2167,8 @@ func (c *MixedDbClient) dbSingleTableKeySubscribe(rsd redisSubData, updateChanne
 					key := subscr.Channel[prefixLen:]
 					newMsi[key] = fp
 					newMsi["delete"] = "null_value"
+					// a delete was streamed, so the row's next write is sent even if it matches the one before
+					msi = make(map[string]interface{})
 				}
 			} else if subscr.Payload == "hset" {
 				//op := "SET"

@@ -1494,6 +1494,8 @@ func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan
 					}
 					key := subscr.Channel[prefixLen:]
 					newMsi[key] = fp
+					// a delete was streamed, so the row's next write is sent even if it matches the one before
+					msi = make(map[string]interface{})
 				}
 			} else if subscr.Payload == "hset" {
 				//op := "SET"
