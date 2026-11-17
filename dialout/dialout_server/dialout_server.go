@@ -97,9 +97,19 @@ func (srv *Server) Port() int64 {
 	return srv.config.Port
 }
 
-// Port returns the port the Server is listening to.
+// SetDataStore sets where the server appends what it receives; with none
+// it prints it.
 func (srv *Server) SetDataStore(dataStore interface{}) {
+	srv.sRWMu.Lock()
+	defer srv.sRWMu.Unlock()
 	srv.dataStore = dataStore
+}
+
+// ReadDataStore runs f while nothing is being appended to the data store.
+func (srv *Server) ReadDataStore(f func()) {
+	srv.sRWMu.RLock()
+	defer srv.sRWMu.RUnlock()
+	f()
 }
 
 // Publish implements the GNMI DialOut Publish RPC.
@@ -196,7 +206,8 @@ func (c *Client) Run(srv *Server, stream spb.GNMIDialOut_PublishServer) (err err
 		}
 
 		srv.sRWMu.Lock()
-		if srv.dataStore != nil {
+		stored := srv.dataStore != nil
+		if stored {
 			switch ds := srv.dataStore.(type) {
 			default:
 				log.V(1).Infof("unexpected type %T\n", srv.dataStore)
@@ -206,7 +217,7 @@ func (c *Client) Run(srv *Server, stream spb.GNMIDialOut_PublishServer) (err err
 		}
 		srv.sRWMu.Unlock()
 
-		if srv.dataStore == nil {
+		if !stored {
 			fmt.Println("== subscribeResponse:")
 			utils.PrintProto(subscribeResponse)
 		}

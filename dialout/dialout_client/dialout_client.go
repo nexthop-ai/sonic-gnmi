@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sonic-net/sonic-gnmi/internal/redisopts"
@@ -23,6 +24,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -124,11 +126,12 @@ type clientSubscription struct {
 	w      sync.WaitGroup       // Wait for all sub go routine to finish
 	opened bool                 // whether there is opened instance for this client subscription
 	cancel context.CancelFunc
+	cfg    ClientConfig // the client configuration when the instance started; read without configMu
 
-	conTryCnt uint64 //Number of time trying to connect
-	sendMsg   uint64
-	recvMsg   uint64
-	errors    uint64
+	conTryCnt atomic.Uint64 //Number of time trying to connect
+	sendMsg   atomic.Uint64
+	recvMsg   atomic.Uint64
+	errors    atomic.Uint64
 }
 
 // Client handles execution of the telemetry publish service.
@@ -170,9 +173,12 @@ func (cs *clientSubscription) Close() {
 	log.V(2).Infof("Closed %v", cs)
 }
 
-func (cs *clientSubscription) NewInstance(ctx context.Context) error {
+// NewInstance starts the instance with cfg, the client configuration it
+// keeps for its whole life, so a later Global edit does not race it.
+func (cs *clientSubscription) NewInstance(ctx context.Context, cfg ClientConfig) error {
 	cs.cMu.Lock()
 	defer cs.cMu.Unlock()
+	cs.cfg = cfg
 
 	if cs.destGroupName == "" {
 		log.V(2).Infof("Destination group is not set for %v", cs)
@@ -185,29 +191,54 @@ func (cs *clientSubscription) NewInstance(ctx context.Context) error {
 		return fmt.Errorf("Destination group %v doesn't exist", cs.destGroupName)
 	}
 
-	target := cs.prefix.GetTarget()
-	if target == "" {
-		return fmt.Errorf("Empty target data not supported yet")
+	if cs.reportType != Periodic && cs.reportType != Stream {
+		// The parser refuses any other report type; this guards callers
+		// that build an entry without it.
+		return fmt.Errorf("Unsupported report type %s in %v", cs.reportType, cs)
 	}
-
-	// Connection to system data source
-	var dc sdc.Client
-	var err error
-	if target == "OTHERS" {
-		dc, err = sdc.NewNonDbClient(cs.paths, cs.prefix)
-	} else if target == "OC_YANG" {
-		dc, err = sdc.NewTranslClient(cs.prefix, cs.paths, ctx, nil, sdc.TranslWildcardOption{})
-	} else {
-		dc, err = sdc.NewDbClient(cs.paths, cs.prefix)
-	}
+	dc, err := cs.openSource(ctx)
 	if err != nil {
-		log.V(1).Infof("Connection to DB for %v failed: %v", *cs, err)
-		return fmt.Errorf("Connection to DB for %v failed: %v", *cs, err)
+		log.V(1).Infof("%v", err)
+		return err
 	}
 	cs.dc = dc
 	go publishRun(ctx, cs, dests)
 	log.V(2).Infof("publishRun for %v with destination %v", cs, dests)
 	return nil
+}
+
+// openSource opens the entry's data source.
+func (cs *clientSubscription) openSource(ctx context.Context) (sdc.Client, error) {
+	target := cs.prefix.GetTarget()
+	if target == "" {
+		return nil, fmt.Errorf("Empty target data not supported yet")
+	}
+	// The data client may rewrite the paths it is given (module prefixes,
+	// wildcard keys), and an instance re-created on a group or Global edit
+	// opens its source from the entry's paths again, so it gets a copy.
+	paths := clonePaths(cs.paths)
+	var dc sdc.Client
+	var err error
+	if target == "OTHERS" {
+		dc, err = sdc.NewNonDbClient(paths, cs.prefix)
+	} else if target == "OC_YANG" {
+		dc, err = sdc.NewTranslClient(cs.prefix, paths, ctx, nil, sdc.TranslWildcardOption{})
+	} else {
+		dc, err = sdc.NewDbClient(paths, cs.prefix)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the data source for target %s: %v", target, err)
+	}
+	return dc, nil
+}
+
+// clonePaths copies paths deeply.
+func clonePaths(paths []*gpb.Path) []*gpb.Path {
+	out := make([]*gpb.Path, len(paths))
+	for i, p := range paths {
+		out[i] = proto.Clone(p).(*gpb.Path)
+	}
+	return out
 }
 
 // send runs until process Queue returns an error.
@@ -220,7 +251,7 @@ func (cs *clientSubscription) send(stream spb.GNMIDialOut_PublishClient) error {
 			return err
 		}
 		if err != nil {
-			cs.errors++
+			cs.errors.Add(1)
 			log.V(1).Infof("%v", err)
 			return fmt.Errorf("unexpected queue Gext(1): %v", err)
 		}
@@ -229,48 +260,55 @@ func (cs *clientSubscription) send(stream spb.GNMIDialOut_PublishClient) error {
 		switch v := items[0].(type) {
 		case sdc.Value:
 			if resp, err = sdc.ValToResp(v); err != nil {
-				cs.errors++
+				cs.errors.Add(1)
 				return err
 			}
 		default:
 			log.V(1).Infof("Unknown data type %v for %s in queue", items[0], cs)
-			cs.errors++
+			cs.errors.Add(1)
 		}
 
-		cs.sendMsg++
+		cs.sendMsg.Add(1)
 		err = stream.Send(resp)
 		if err != nil {
 			log.V(1).Infof("Client %s sending error:%v", cs, err)
-			cs.errors++
+			cs.errors.Add(1)
 			return err
 		}
-		log.V(5).Infof("Client %s done sending, msg count %d, msg %v", cs, cs.sendMsg, resp)
+		log.V(5).Infof("Client %s done sending, msg count %d, msg %v", cs, cs.sendMsg.Load(), resp)
 	}
 }
 
 // String returns the target the client is querying.
 func (cs *clientSubscription) String() string {
 	return fmt.Sprintf(" %s:%s:%s prefix %v paths %v interval %v, sendMsg %v, recvMsg %v",
-		cs.name, cs.destGroupName, cs.reportType, cs.prefix.GetTarget(), cs.paths, cs.interval, cs.sendMsg, cs.recvMsg)
+		cs.name, cs.destGroupName, cs.reportType, cs.prefix.GetTarget(), cs.paths, cs.interval, cs.sendMsg.Load(), cs.recvMsg.Load())
 }
 
 // newClient returns a new initialized GNMIDialout client.
 // it connects to destination and publish service
 // TODO: TLS credential support
-func newClient(ctx context.Context, dest Destination) (*Client, error) {
-	timeout := clientCfg.RetryInterval
+func newClient(ctx context.Context, cfg ClientConfig, dest Destination) (*Client, error) {
+	timeout := cfg.RetryInterval
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	opts := []grpc.DialOption{
 		grpc.WithBlock(),
+<<<<<<< HEAD
+=======
+		grpc.WithContextDialer(vrfDialer(cfg.Vrf)),
+		// Report the dialer's error, such as a bind to a VRF device that
+		// does not exist, not only the deadline.
+		grpc.WithReturnConnectionError(),
+>>>>>>> bef94fc (NOS-23563: [dialout_client] Give each instance its own config copy, and close a connection dialed after a cancel (#400))
 	}
-	if clientCfg.TLS != nil {
-		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(clientCfg.TLS)))
+	if cfg.TLS != nil {
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(cfg.TLS)))
 	}
 	conn, err := grpc.DialContext(ctx, dest.Addrs, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("Dial to (%s, timeout %v): %v", dest, timeout, err)
+		return nil, fmt.Errorf("Dial to %s (timeout %v): %v", dest.Addrs, timeout, err)
 	}
 	cl := spb.NewGNMIDialOutClient(conn)
 	return &Client{
@@ -285,6 +323,10 @@ func newClient(ctx context.Context, dest Destination) (*Client, error) {
 func (c *Client) Close() error {
 	return c.conn.Close()
 }
+
+// dialCollector dials a destination; a variable so a test can land a
+// cancel between a dial that succeeded and the check that follows it.
+var dialCollector = newClient
 
 func publishRun(ctx context.Context, cs *clientSubscription, dests []Destination) {
 	var err error
@@ -301,19 +343,24 @@ restart: //Remote server might go down, in that case we restart with next destin
 	cs.client = nil
 	cs.cMu.Unlock()
 
-	cs.conTryCnt++
+	cs.conTryCnt.Add(1)
 	dest := dests[destIdx]
 	destIdx = (destIdx + 1) % destNum
-	c, err = newClient(ctx, dest)
+	c, err = dialCollector(ctx, cs.cfg, dest)
 	select {
 	case <-ctx.Done():
+		// A dial that succeeded just as the instance was cancelled: its
+		// connection is not cs.client yet, so close it here.
+		if c != nil {
+			c.Close()
+		}
 		cs.Close()
-		log.V(1).Infof("%v: %v, cs.conTryCnt %v", cs, err, cs.conTryCnt)
+		log.V(1).Infof("%v: %v, cs.conTryCnt %v", cs, err, cs.conTryCnt.Load())
 		return
 	default:
 	}
 	if err != nil {
-		log.V(1).Infof("Dialout connection for %v failed for %v, %v cs.conTryCnt %v", dest, cs.name, err, cs.conTryCnt)
+		log.V(1).Infof("Dialout connection for %v failed for %v, %v cs.conTryCnt %v", dest, cs.name, err, cs.conTryCnt.Load())
 		goto restart
 	}
 
@@ -326,15 +373,19 @@ restart: //Remote server might go down, in that case we restart with next destin
 		goto restart
 	}
 
+	// The check and the store are one step under cMu, so a Close that runs
+	// at the same time either sees this connection or makes the check fail.
 	cs.cMu.Lock()
-	if cs.client == nil {
-		cs.client = c
-	} else {
-		log.V(1).Infof("connection to %v already exists for %v, exiting publishRun", dest, cs)
-		c.Close()
+	if !cs.opened || cs.client != nil {
+		closed := !cs.opened
 		cs.cMu.Unlock()
+		if !closed {
+			log.V(1).Infof("connection to %v already exists for %v, exiting publishRun", dest, cs)
+		}
+		c.Close() // torn down since the dial, or a connection is already open
 		return
 	}
+	cs.client = c
 	cs.cMu.Unlock()
 
 	switch cs.reportType {
@@ -370,13 +421,13 @@ restart: //Remote server might go down, in that case we restart with next destin
 				log.V(6).Infof("cs %s sending \n\t%v \n To %s", cs.name, response, dest)
 				err = pub.Send(response)
 				if err != nil {
-					log.V(1).Infof("Client %v pub Send error:%v, cs.conTryCnt %v", cs.name, err, cs.conTryCnt)
+					log.V(1).Infof("Client %v pub Send error:%v, cs.conTryCnt %v", cs.name, err, cs.conTryCnt.Load())
 					cs.Close()
 					// Retry
 					goto restart
 				}
 				log.V(6).Infof("cs %s to  %s done", cs.name, dest)
-				cs.sendMsg++
+				cs.sendMsg.Add(1)
 				c.sendMsg++
 
 				time.Sleep(cs.interval)
@@ -393,20 +444,28 @@ restart: //Remote server might go down, in that case we restart with next destin
 			time.Sleep(100 * time.Millisecond)
 			err = cs.send(pub)
 			if err != nil {
-				log.V(1).Infof("Client %v pub Send error:%v, cs.conTryCnt %v", cs.name, err, cs.conTryCnt)
+				log.V(1).Infof("Client %v pub Send error:%v, cs.conTryCnt %v", cs.name, err, cs.conTryCnt.Load())
 			}
 			cs.Close()
 			cs.w.Wait()
+<<<<<<< HEAD
 			// Don't restart immediatly
 			time.Sleep(clientCfg.RetryInterval)
+=======
+			// The blocking dial in newClient already retries for up to
+			// RetryInterval, on gRPC's connect backoff, so only a session that died
+			// early needs a pause, to keep a collector that accepts and closes from
+			// causing a tight loop.
+			if time.Since(started) < cs.cfg.RetryInterval {
+				time.Sleep(cs.cfg.RetryInterval)
+			}
+>>>>>>> bef94fc (NOS-23563: [dialout_client] Give each instance its own config copy, and close a connection dialed after a cancel (#400))
 			goto restart
 
 		case <-cs.stop:
 			log.V(1).Infof("%v exiting publishRun routine for destination %s", cs, dest)
 			return
 		}
-	default:
-		log.V(1).Infof("Unsupported report type %s in %v ", cs.reportType, cs)
 	}
 }
 
@@ -459,8 +518,15 @@ func setupDestGroupClients(ctx context.Context, destGroupName string) {
 			// Create a copy of Client subscription, existing one might be closing, don't interfere with it.
 			cs := *ClientSubscriptionNameMap[name]
 			log.V(2).Infof("NewInstance with destGroup change for %s to %s", name, destGroupName)
+<<<<<<< HEAD
 			cs.NewInstance(ctx)
 			ClientSubscriptionNameMap[name] = &cs
+=======
+			if err := cs.NewInstance(cctx, *clientCfg); err != nil {
+				log.V(1).Infof("Subscription %v is registered but not started: %v", name, err)
+			}
+			ClientSubscriptionNameMap[name] = cs
+>>>>>>> bef94fc (NOS-23563: [dialout_client] Give each instance its own config copy, and close a connection dialed after a cancel (#400))
 		}
 	}
 }
@@ -656,7 +722,15 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 			}
 			ClientSubscriptionNameMap[cs.name] = &cs
 			log.V(2).Infof("NewInstance with Subscription change for %s to %s", cs.name, cs.destGroupName)
+<<<<<<< HEAD
 			cs.NewInstance(ctx)
+=======
+			if err := cs.NewInstance(instCtx, *clientCfg); err != nil {
+				// The row stays registered: a group that does not exist
+				// yet starts it when its row arrives.
+				log.V(1).Infof("Subscription %v is registered but not started: %v", cs.name, err)
+			}
+>>>>>>> bef94fc (NOS-23563: [dialout_client] Give each instance its own config copy, and close a connection dialed after a cancel (#400))
 		}
 	}
 	return nil
