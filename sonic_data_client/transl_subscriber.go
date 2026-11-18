@@ -45,6 +45,7 @@ type translSubscriber struct {
 	rcvdPaths   map[string]bool // Paths from received SubscribeResponse
 	msgBuilder  notificationBuilder
 	sampleWg    *sync.WaitGroup // WaitGroup to indicate when Sample subscriptions have finished processing
+	shared      bool            // Updates go to every client of the superSubscription (a tick of its primary)
 }
 
 // notificationBuilder creates gnmipb.Notification from a translib.SubscribeResponse
@@ -144,8 +145,9 @@ func (ts *translSubscriber) processResponses(q *queue.PriorityQueue) {
 
 			if v.IsTerminated {
 				//DB Connection or other backend error
+				// The Fatal ends the stream. The stop channel is the
+				// caller's to close; closing it here made its close panic.
 				enqueFatalMsgTranslib(c, "DB Connection Error")
-				close(c.channel)
 				return
 			}
 
@@ -191,7 +193,7 @@ func (ts *translSubscriber) notify(v *translib.SubscribeResponse) error {
 	}
 
 	spbv := &spb.Value{Notification: msg}
-	if ts.client.superSub != nil && v == nil {
+	if ts.client.superSub != nil && (v == nil || ts.shared) {
 		ts.client.superSub.sendNotifications(spbv)
 		ts.client.superSub.sharedUpdates.Add(1)
 	} else {

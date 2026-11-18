@@ -498,17 +498,25 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 		}
 		for _, tick := range ticks {
 			log.V(6).Infof("tick, heartbeat: %t, path: %s\n", tick.heartbeat, c.path2URI[tick.sub.Path])
-			ts := translSubscriber{
-				client:      c,
-				session:     ss,
-				sampleCache: sampleCache[tick.pathStr],
-				filterDups:  (!tick.heartbeat && tick.sub.SuppressRedundant),
-				sampleWg:    wg,
-			}
-			tickSubChan <- pathFromSubReq{path: tick.pathStr, ts: &ts}
+			ts := tickSubscriber(c, ss, sampleCache[tick.pathStr], tick, wg)
+			tickSubChan <- pathFromSubReq{path: tick.pathStr, ts: ts}
 		}
 		close(tickSubChan)
 		wg.Wait()
+	}
+}
+
+// tickSubscriber returns the subscriber that samples one path on a tick.
+// It is shared: only the primary client of a superSubscription ticks, so
+// its updates have to reach every client.
+func tickSubscriber(c *TranslClient, ss *translib.SubscribeSession, cache *ygotCache, tick *ticker_info, wg *sync.WaitGroup) *translSubscriber {
+	return &translSubscriber{
+		client:      c,
+		session:     ss,
+		sampleCache: cache,
+		filterDups:  (!tick.heartbeat && tick.sub.SuppressRedundant),
+		sampleWg:    wg,
+		shared:      true,
 	}
 }
 

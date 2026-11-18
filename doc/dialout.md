@@ -67,10 +67,20 @@ There are three categories of configuration:
   Number of DestinationGroups is not limited.
 * Subscription
   * dst_group: The DestinationGroup to be used by this subscription.
-  * path_target: The DB target for this subscription
+  * path_target: Where the paths are read from: a database (`APPL_DB`, `CONFIG_DB`, `COUNTERS_DB`, `STATE_DB`), `OC_YANG` for OpenConfig paths, or `OTHERS` for the non-database paths such as `proc/uptime`.
   * paths:  The list of paths subscribed to in this instance of subscription.
+<<<<<<< HEAD
   * report_type: May be one of "periodic", "stream" or "once". "periodic" is the default value
   * report_interval:  How frequent the data for all paths should be sent to collector, in millisecond, default value is "5000".
+=======
+  * report_type: "periodic" or "stream". "periodic" is the default value. A row with any other value is refused whole and reported at `-v 1`; the running subscription is left as it was. "periodic" sends the data for all paths every report_interval. "stream" sends the data for all paths once, then a sync response, then updates, and what an update is depends on path_target:
+    * a database: each change, as it happens.
+    * `OC_YANG`: each change, for a path that is streamed on change; a path that is not is sampled at the interval the switch sets for it. These are the choices a dial-in subscription in `TARGET_DEFINED` mode gets.
+    * `OTHERS`: a sample of every path each report_interval, as a dial-in `SAMPLE` subscription gets.
+  * report_interval: In millisecond, from 1 to 99999999, default value is "5000". A row with any other value is refused whole. For "periodic" it is how often the data for all paths is sent to the collector. For a "stream" to `OTHERS` it is the sampling interval, and a row with less than 1000 is refused whole and reported at `-v 1`. A "stream" to a database or to `OC_YANG` does not use it.
+
+  A "stream" whose paths the data source refuses to subscribe, such as an `OC_YANG` path that cannot be streamed, is stopped and reported as an error in the log. It is not retried; it starts again when the row or its DestinationGroup is edited.
+>>>>>>> 7baff22 (NOS-23425: [dialout_client] Give OC_YANG and OTHERS streams a subscription list (#405))
 
 One example configuration:
 ```

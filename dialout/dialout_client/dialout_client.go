@@ -124,6 +124,13 @@ type clientSubscription struct {
 	w      sync.WaitGroup       // Wait for all sub go routine to finish
 	opened bool                 // whether there is opened instance for this client subscription
 	cancel context.CancelFunc
+<<<<<<< HEAD
+=======
+	cfg    ClientConfig // the client configuration when the instance started; read without configMu
+	// subList is what a stream passes to the data client's StreamRun; nil
+	// for a database target, whose client streams without one.
+	subList *gpb.SubscriptionList
+>>>>>>> 7baff22 (NOS-23425: [dialout_client] Give OC_YANG and OTHERS streams a subscription list (#405))
 
 	conTryCnt uint64 //Number of time trying to connect
 	sendMsg   uint64
@@ -210,6 +217,64 @@ func (cs *clientSubscription) NewInstance(ctx context.Context) error {
 	return nil
 }
 
+<<<<<<< HEAD
+=======
+// openSource opens the entry's data source and, for a stream to OC_YANG or
+// OTHERS, sets the subscription list its StreamRun is given.
+func (cs *clientSubscription) openSource(ctx context.Context) (sdc.Client, error) {
+	target := cs.prefix.GetTarget()
+	if target == "" {
+		return nil, fmt.Errorf("Empty target data not supported yet")
+	}
+	// The data client may rewrite the paths it is given (module prefixes,
+	// wildcard keys), and an instance re-created on a group or Global edit
+	// opens its source from the entry's paths again, so it gets a copy.
+	paths := clonePaths(cs.paths)
+	var dc sdc.Client
+	var err error
+	if target == "OTHERS" {
+		dc, err = sdc.NewNonDbClient(paths, cs.prefix)
+		cs.subList = streamList(cs.prefix, paths, gpb.SubscriptionMode_SAMPLE, cs.interval, cs.cfg.Encoding)
+	} else if target == "OC_YANG" {
+		dc, err = sdc.NewTranslClient(cs.prefix, paths, ctx, nil, sdc.TranslWildcardOption{})
+		cs.subList = streamList(cs.prefix, paths, gpb.SubscriptionMode_TARGET_DEFINED, 0, cs.cfg.Encoding)
+	} else {
+		dc, err = sdc.NewDbClient(paths, cs.prefix)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the data source for target %s: %v", target, err)
+	}
+	return dc, nil
+}
+
+// clonePaths copies paths deeply.
+func clonePaths(paths []*gpb.Path) []*gpb.Path {
+	out := make([]*gpb.Path, len(paths))
+	for i, p := range paths {
+		out[i] = proto.Clone(p).(*gpb.Path)
+	}
+	return out
+}
+
+// streamList is the subscription list a stream passes to its data client,
+// as a dial-in Subscribe would: every path in the given mode, sampled every
+// interval (0 leaves the interval to the target). The paths must be the
+// ones the data client was built with, since it looks them up by pointer.
+func streamList(prefix *gpb.Path, paths []*gpb.Path, mode gpb.SubscriptionMode, interval time.Duration, enc gpb.Encoding) *gpb.SubscriptionList {
+	subs := make([]*gpb.Subscription, len(paths))
+	for i, p := range paths {
+		subs[i] = &gpb.Subscription{Path: p, Mode: mode, SampleInterval: uint64(interval)}
+	}
+	return &gpb.SubscriptionList{Prefix: prefix, Subscription: subs, Mode: gpb.SubscriptionList_STREAM, Encoding: enc}
+}
+
+// refusedError is a stream ended by the data client refusing the entry's
+// subscription list. A retry would be refused the same way.
+type refusedError struct{ msg string }
+
+func (e refusedError) Error() string { return e.msg }
+
+>>>>>>> 7baff22 (NOS-23425: [dialout_client] Give OC_YANG and OTHERS streams a subscription list (#405))
 // send runs until process Queue returns an error.
 func (cs *clientSubscription) send(stream spb.GNMIDialOut_PublishClient) error {
 	for {
@@ -227,6 +292,15 @@ func (cs *clientSubscription) send(stream spb.GNMIDialOut_PublishClient) error {
 
 		var resp *gpb.SubscribeResponse
 		switch v := items[0].(type) {
+<<<<<<< HEAD
+=======
+		case sdc.RequestFatal:
+			// The data client cannot serve an entry of the subscription
+			// list, such as an OC_YANG path translib will not subscribe.
+			cs.errors.Add(1)
+			_, err = sdc.ValToResp(v.Value)
+			return refusedError{err.Error()}
+>>>>>>> 7baff22 (NOS-23425: [dialout_client] Give OC_YANG and OTHERS streams a subscription list (#405))
 		case sdc.Value:
 			if resp, err = sdc.ValToResp(v); err != nil {
 				cs.errors++
@@ -389,7 +463,12 @@ restart: //Remote server might go down, in that case we restart with next destin
 		select {
 		default:
 			cs.w.Add(1)
+<<<<<<< HEAD
 			go cs.dc.StreamRun(cs.q, cs.stop, &cs.w, nil)
+=======
+			go cs.dc.StreamRun(cs.q, cs.stop, &cs.w, cs.subList)
+			started := time.Now()
+>>>>>>> 7baff22 (NOS-23425: [dialout_client] Give OC_YANG and OTHERS streams a subscription list (#405))
 			time.Sleep(100 * time.Millisecond)
 			err = cs.send(pub)
 			if err != nil {
@@ -397,8 +476,24 @@ restart: //Remote server might go down, in that case we restart with next destin
 			}
 			cs.Close()
 			cs.w.Wait()
+<<<<<<< HEAD
 			// Don't restart immediatly
 			time.Sleep(clientCfg.RetryInterval)
+=======
+			if refused := (refusedError{}); errors.As(err, &refused) {
+				// Not retried: an edit of the row or of its destination
+				// group starts a new instance.
+				log.Errorf("Subscription %v stopped, the data source refused it: %v", cs.name, err)
+				return
+			}
+			// The blocking dial in newClient already retries for up to
+			// RetryInterval, on gRPC's connect backoff, so only a session that died
+			// early needs a pause, to keep a collector that accepts and closes from
+			// causing a tight loop.
+			if time.Since(started) < cs.cfg.RetryInterval {
+				time.Sleep(cs.cfg.RetryInterval)
+			}
+>>>>>>> 7baff22 (NOS-23425: [dialout_client] Give OC_YANG and OTHERS streams a subscription list (#405))
 			goto restart
 
 		case <-cs.stop:
@@ -430,8 +525,16 @@ restart: //Remote server might go down, in that case we restart with next destin
 	path_target = DbName
 	paths       = PATH1,PATH2        ;PATH separated by ","
 	dst_group   = <name>      ; // name of DestinationGroup
+<<<<<<< HEAD
 	report_type = "periodic" / "stream" / "once"
 	report_interval = 1*8DIGIT      ; In millisecond,
+=======
+	report_type = "periodic" / "stream"   ; periodic by default
+	report_interval = 1*8DIGIT      ; In millisecond, 1-99999999, 5000 by default.
+	                                ; periodic: the pause between dumps of all paths.
+	                                ; stream to OTHERS: the sampling interval, 1000 or more.
+	                                ; stream to OC_YANG or a database: not used.
+>>>>>>> 7baff22 (NOS-23425: [dialout_client] Give OC_YANG and OTHERS streams a subscription list (#405))
 
 	The sonic-telemetry_client YANG model declares the list key as "prefix name",
 	so YANG-validated tooling (config replace, GCU, golden config) spells the same
@@ -637,6 +740,17 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 					return fmt.Errorf("Invalid field %v value %v", field, value)
 				}
 			}
+<<<<<<< HEAD
+=======
+			if cs.prefix.GetTarget() == "" {
+				return fmt.Errorf("Subscription %v refused: no path_target", name)
+			}
+			// A stream to OTHERS is sampled every report_interval, and its
+			// data client refuses to sample faster than MinSampleInterval.
+			if cs.reportType == Stream && cs.prefix.GetTarget() == "OTHERS" && cs.interval < sdc.MinSampleInterval {
+				return fmt.Errorf("Subscription %v refused: a stream to OTHERS is sampled every report_interval, which cannot be less than %v", name, sdc.MinSampleInterval)
+			}
+>>>>>>> 7baff22 (NOS-23425: [dialout_client] Give OC_YANG and OTHERS streams a subscription list (#405))
 			log.V(2).Infof("New clientSubscription %v", cs)
 			if cs.destGroupName == "" {
 				// not destination configured, just return
