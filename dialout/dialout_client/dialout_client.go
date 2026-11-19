@@ -131,6 +131,20 @@ type clientSubscription struct {
 	errors    uint64
 }
 
+// configCopy is a new entry with cs's configuration, the Config Data
+// fields, and none of its runtime state. A field added to Config Data must
+// be added here.
+func (cs *clientSubscription) configCopy() *clientSubscription {
+	return &clientSubscription{
+		name:          cs.name,
+		destGroupName: cs.destGroupName,
+		prefix:        cs.prefix,
+		paths:         cs.paths,
+		reportType:    cs.reportType,
+		interval:      cs.interval,
+	}
+}
+
 // Client handles execution of the telemetry publish service.
 type Client struct {
 	conn *grpc.ClientConn
@@ -210,6 +224,103 @@ func (cs *clientSubscription) NewInstance(ctx context.Context) error {
 	return nil
 }
 
+<<<<<<< HEAD
+=======
+// retryLater builds the instance again after RetryInterval when its data
+// source could not be opened. Some of those errors clear on their own (a
+// database that does not answer yet at boot); others, such as a mistyped
+// target, last until the entry is edited, and are retried at the same pace,
+// with the reason in the log. It gives up once the entry has been replaced or
+// removed, or the instance cancelled.
+func (cs *clientSubscription) retryLater(ctx context.Context) {
+	time.AfterFunc(cs.cfg.RetryInterval, func() {
+		configMu.Lock()
+		defer configMu.Unlock()
+		if ctx.Err() == nil && ClientSubscriptionNameMap[cs.name] == cs {
+			cs.NewInstance(ctx, cs.cfg)
+		}
+	})
+}
+
+// serving reports whether the instance runs, as opposed to waiting for its
+// destination group or its data source. dc is set only where NewInstance
+// starts publishRun. Every teardown replaces or removes the entry: a group
+// delete re-registers its subscriptions as copies that wait for the group.
+// So for the entry in ClientSubscriptionNameMap a set dc means a running
+// instance.
+func (cs *clientSubscription) serving() bool {
+	cs.cMu.Lock()
+	defer cs.cMu.Unlock()
+	return cs.dc != nil
+}
+
+// openSource opens the entry's data source and, for a stream to OC_YANG or
+// OTHERS, sets the subscription list its StreamRun is given.
+func (cs *clientSubscription) openSource(ctx context.Context) (sdc.Client, error) {
+	target := cs.prefix.GetTarget()
+	if target == "" {
+		return nil, fmt.Errorf("Empty target data not supported yet")
+	}
+	// The data client may rewrite the paths it is given (module prefixes,
+	// wildcard keys), and an instance re-created on a group or Global edit
+	// opens its source from the entry's paths again, so it gets a copy.
+	paths := clonePaths(cs.paths)
+	var dc sdc.Client
+	var err error
+	if target == "OTHERS" {
+		dc, err = sdc.NewNonDbClient(paths, cs.prefix)
+		cs.subList = streamList(cs.prefix, paths, gpb.SubscriptionMode_SAMPLE, cs.interval, cs.cfg.Encoding)
+	} else if target == "OC_YANG" {
+		dc, err = sdc.NewTranslClient(cs.prefix, paths, ctx, nil, sdc.TranslWildcardOption{})
+		cs.subList = streamList(cs.prefix, paths, gpb.SubscriptionMode_TARGET_DEFINED, 0, cs.cfg.Encoding)
+	} else {
+		dc, err = sdc.NewDbClient(paths, cs.prefix)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the data source for target %s: %v", target, err)
+	}
+	return dc, nil
+}
+
+// clonePaths copies paths deeply.
+func clonePaths(paths []*gpb.Path) []*gpb.Path {
+	out := make([]*gpb.Path, len(paths))
+	for i, p := range paths {
+		out[i] = proto.Clone(p).(*gpb.Path)
+	}
+	return out
+}
+
+// streamList is the subscription list a stream passes to its data client,
+// as a dial-in Subscribe would: every path in the given mode, sampled every
+// interval (0 leaves the interval to the target). The paths must be the
+// ones the data client was built with, since it looks them up by pointer.
+func streamList(prefix *gpb.Path, paths []*gpb.Path, mode gpb.SubscriptionMode, interval time.Duration, enc gpb.Encoding) *gpb.SubscriptionList {
+	subs := make([]*gpb.Subscription, len(paths))
+	for i, p := range paths {
+		subs[i] = &gpb.Subscription{Path: p, Mode: mode, SampleInterval: uint64(interval)}
+	}
+	return &gpb.SubscriptionList{Prefix: prefix, Subscription: subs, Mode: gpb.SubscriptionList_STREAM, Encoding: enc}
+}
+
+// refusedError is a stream ended by the data client refusing the entry's
+// subscription list. A retry would be refused the same way.
+type refusedError struct{ msg string }
+
+func (e refusedError) Error() string { return e.msg }
+
+// sourceError reports why the entry's data source cannot be opened, and
+// closes it again when it can.
+func (cs *clientSubscription) sourceError(ctx context.Context) error {
+	dc, err := cs.openSource(ctx)
+	if err != nil {
+		return err
+	}
+	dc.Close()
+	return nil
+}
+
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 // send runs until process Queue returns an error.
 func (cs *clientSubscription) send(stream spb.GNMIDialOut_PublishClient) error {
 	for {
@@ -417,6 +528,8 @@ restart: //Remote server might go down, in that case we restart with next destin
 	retry_interval = 1*4DIGIT     ; In second
 	encoding    = "JSON_IETF" / "ASCII" / "BYTES" / "PROTO"
 	unidirectional = "true" / "false"    ; true by default
+	; a Global row with any other field is refused whole. In every row
+	; the NULL placeholder of an entry with no fields is skipped, not refused.
 
 	// Destination group
 	Key      = TELEMETRY_CLIENT|DestinationGroup_<name>
@@ -427,11 +540,22 @@ restart: //Remote server might go down, in that case we restart with next destin
 
 	// Subscription group
 	Key         = TELEMETRY_CLIENT|Subscription_<name>
+<<<<<<< HEAD
 	path_target = DbName
 	paths       = PATH1,PATH2        ;PATH separated by ","
 	dst_group   = <name>      ; // name of DestinationGroup
 	report_type = "periodic" / "stream" / "once"
 	report_interval = 1*8DIGIT      ; In millisecond,
+=======
+	path_target = DbName              ; required
+	paths       = PATH1,PATH2         ; required; PATH separated by ","
+	dst_group   = <name>              ; required; name of DestinationGroup
+	report_type = "periodic" / "stream"   ; periodic by default
+	report_interval = 1*8DIGIT      ; In millisecond, 1-99999999, 5000 by default.
+	                                ; periodic: the pause between dumps of all paths.
+	                                ; stream to OTHERS: the sampling interval, 1000 or more.
+	                                ; stream to OC_YANG or a database: not used.
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 
 	The sonic-telemetry_client YANG model declares the list key as "prefix name",
 	so YANG-validated tooling (config replace, GCU, golden config) spells the same
@@ -451,13 +575,77 @@ func closeDestGroupClient(destGroupName string) {
 	}
 }
 
+<<<<<<< HEAD
+=======
+// closeInstance is every teardown of a live instance: it closes the
+// instance and cancels its context, if it has one.
+func closeInstance(cs *clientSubscription) {
+	cs.Close()
+	if cs.cancel != nil {
+		cs.cancel()
+	}
+}
+
+// takeDown stops an entry's instance and removes it from the maps.
+func takeDown(cs *clientSubscription) {
+	closeInstance(cs)
+	unregisterSubscription(cs)
+}
+
+// editRetry holds, by Subscription name, the timer that applies the row
+// again after an edit was refused because its data source could not be
+// opened. Any event for the row, and the end of the run, stops it.
+var editRetry = map[string]*time.Timer{}
+
+// retryEditLater applies the Subscription row again after RetryInterval.
+// The data clients do not tell an error that clears on its own from one
+// that lasts until the row is edited, so both are retried, as retryLater
+// does for an entry that is not serving.
+func retryEditLater(ctx context.Context, redisDb *redis.Client, key string, name string) {
+	var t *time.Timer
+	t = time.AfterFunc(clientCfg.RetryInterval, func() {
+		configMu.Lock()
+		defer configMu.Unlock()
+		if ctx.Err() != nil || editRetry[name] != t {
+			return
+		}
+		delete(editRetry, name)
+		if err := processTelemetryClientConfigLocked(ctx, redisDb, key, "hset"); err != nil {
+			log.V(1).Infof("TELEMETRY_CLIENT %v retry refused: %v", key, err)
+		}
+	})
+	editRetry[name] = t
+}
+
+// stopEditRetry drops the pending retry of a refused edit, if there is one.
+func stopEditRetry(name string) {
+	if t, ok := editRetry[name]; ok {
+		t.Stop()
+		delete(editRetry, name)
+	}
+}
+
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 // setupDestGroupClients create client instances for all clientSubscription using
 // this Destination Group
 func setupDestGroupClients(ctx context.Context, destGroupName string) {
 	if names, ok := DestGrp2ClientSubMap[destGroupName]; ok {
 		for _, name := range names {
+<<<<<<< HEAD
 			// Create a copy of Client subscription, existing one might be closing, don't interfere with it.
 			cs := *ClientSubscriptionNameMap[name]
+=======
+			// A new instance from the entry's configuration; the one being
+			// closed keeps its own runtime state and is not touched. The new
+			// one has its own context, so it can be cancelled on its own.
+			old := ClientSubscriptionNameMap[name]
+			if old == nil {
+				continue
+			}
+			cs := old.configCopy()
+			cctx, cancel := context.WithCancel(ctx)
+			cs.cancel = cancel
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 			log.V(2).Infof("NewInstance with destGroup change for %s to %s", name, destGroupName)
 			cs.NewInstance(ctx)
 			ClientSubscriptionNameMap[name] = &cs
@@ -480,9 +668,38 @@ func matchRowPrefix(key string, rowType string, separator string) (string, bool)
 	return "", false
 }
 
+<<<<<<< HEAD
+=======
+// rowUpdated reports whether a delete event left fields under the key. A
+// keyspace hdel also fires when one field of a row is removed; the row is
+// gone only when nothing is left.
+func rowUpdated(op string, fv map[string]string) bool {
+	return op == "hdel" && len(fv) > 0
+}
+
+// applyTelemetryClientConfig applies one TELEMETRY_CLIENT row change. The
+// V(1) line here is the only trace of a refused row: it is not applied again
+// until it is written again, except a Subscription edit whose data source
+// could not be opened (see retryEditLater).
+func applyTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, key string, op string) {
+	if err := processTelemetryClientConfig(ctx, redisDb, key, op); err != nil {
+		log.V(1).Infof("TELEMETRY_CLIENT %v %v refused: %v", key, op, err)
+	}
+}
+
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 // start/stop/update telemetry publist client as requested
 // TODO: more validation on db data
 func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, key string, op string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	return processTelemetryClientConfigLocked(ctx, redisDb, key, op)
+}
+
+// processTelemetryClientConfigLocked is processTelemetryClientConfig with
+// configMu held. The row is read under the lock, so the retry of a refused
+// edit never applies a row older than one already applied.
+func processTelemetryClientConfigLocked(ctx context.Context, redisDb *redis.Client, key string, op string) error {
 	ns, _ := sdcfg.GetDbDefaultNamespace()
 	separator, err := sdc.GetTableKeySeparator("CONFIG_DB", ns)
 	if err != nil {
@@ -495,13 +712,20 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 		return fmt.Errorf("redis HGetAll failed for %s with error %v", tableKey, err)
 	}
 
+	// NULL is the placeholder CONFIG_DB writers store for an entry with no
+	// fields; such an entry reads as empty.
+	delete(fv, "NULL")
+	// A key already gone by the time it is read is a delete, whatever the
+	// event said: an empty entry has nothing to apply.
+	if len(fv) == 0 {
+		op = "hdel"
+	}
 	log.V(2).Infof("Processing %v %v", tableKey, fv)
-	configMu.Lock()
-	defer configMu.Unlock()
 
 	ctx, cancel := context.WithCancel(ctx)
 
 	if key == "Global" {
+<<<<<<< HEAD
 		if op == "hdel" {
 			log.V(2).Infof("Invalid delete operation for %v", tableKey)
 			return fmt.Errorf("Invalid delete operation for %v", tableKey)
@@ -531,6 +755,45 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 				closeDestGroupClient(grpName)
 				setupDestGroupClients(ctx, grpName)
 			}
+=======
+		// fv is the whole entry, empty once the key is deleted. Global has
+		// no lifetime of its own: a field it no longer has, or every field
+		// after a delete, goes back to the value the run started with. The
+		// row is checked whole before any of it is applied, so a refused row
+		// changes nothing and re-dials nothing.
+		cfg := globalDefaults
+		for field, value := range fv {
+			switch field {
+			case "src_ip":
+				cfg.SrcIp = value
+			case "vrf":
+				cfg.Vrf = value
+			case "retry_interval":
+				// At 0 every dial has already timed out and is retried at once.
+				itvl, err := strconv.ParseUint(value, 10, 64)
+				if err != nil || itvl == 0 || itvl > maxRetryIntervalSecs {
+					return fmt.Errorf("Global refused: retry_interval %q is not a number of seconds from 1 to %v", value, maxRetryIntervalSecs)
+				}
+				cfg.RetryInterval = time.Second * time.Duration(itvl)
+			case "encoding":
+				//Flexible encoding Not supported yet
+				cfg.Encoding = gpb.Encoding_JSON_IETF
+			case "unidirectional":
+				// No PublishResponse supported yet
+				cfg.Unidirectional = true
+			default:
+				return fmt.Errorf("Global refused: unknown field %v value %v", field, value)
+			}
+		}
+		if cfg == *clientCfg {
+			return nil // nothing changed: leave the running instances alone
+		}
+		*clientCfg = cfg
+		// Apply changes to all running instances
+		for grpName := range destGrpNameMap {
+			closeDestGroupClient(grpName)
+			setupDestGroupClients(ctx, grpName)
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 		}
 	} else if destGroupName, matched := matchRowPrefix(key, "DestinationGroup", separator); matched {
 		if destGroupName == "" {
@@ -569,14 +832,33 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 			destGrpNameMap[destGroupName] = dests
 			setupDestGroupClients(ctx, destGroupName)
 		}
+<<<<<<< HEAD
+=======
+		if len(dests) == 0 {
+			// A subscription started on an empty list panics the dial-out
+			// client.
+			return fmt.Errorf("DestinationGroup %v refused: no dst_addr", destGroupName)
+		}
+		// Close any client instances targeting this Destination group, then
+		// re-dial them against the new list.
+		closeDestGroupClient(destGroupName)
+		destGrpNameMap[destGroupName] = dests
+		setupDestGroupClients(ctx, destGroupName)
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 	} else if name, matched := matchRowPrefix(key, "Subscription", separator); matched {
 		if name == "" {
 			return fmt.Errorf("Empty Subscription name %v", key)
 		}
 		csub, ok := ClientSubscriptionNameMap[name]
+<<<<<<< HEAD
 		if ok {
 			csub.Close()
 			csub.cancel()
+=======
+		stopEditRetry(name)
+		if rowUpdated(op, fv) {
+			op = "hset"
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 		}
 
 		if op == "hdel" {
@@ -589,6 +871,7 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 					break
 				}
 			}
+<<<<<<< HEAD
 			DestGrp2ClientSubMap[destGrpName] = csNames
 			// Delete clientSubscription from name map
 			delete(ClientSubscriptionNameMap, name)
@@ -627,22 +910,121 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 						if err != nil {
 							log.V(2).Infof("Invalid paths %v", value)
 							return fmt.Errorf("Invalid paths %v", value)
-						}
-						// append *gpb.Path
-						newPaths = append(newPaths, pp)
-					}
-					cs.paths = newPaths
-				default:
-					log.V(2).Infof("Invalid field %v value %v", field, value)
-					return fmt.Errorf("Invalid field %v value %v", field, value)
+=======
+			takeDown(csub)
+			log.V(3).Infof("Deleted  Client Subscription %v", name)
+			return nil
+		} else {
+			// The instance's own context; cancelled here unless an instance
+			// takes it.
+			runCtx := ctx
+			ctx, cancel := context.WithCancel(ctx)
+			kept := false
+			defer func() {
+				if !kept {
+					cancel()
 				}
+			}()
+			cs := clientSubscription{
+				interval:   5000 * time.Millisecond, // default to 5000 milliseconds
+				reportType: Periodic,
+				name:       name,
+				cancel:     cancel,
+			}
+			parse := func() error {
+				for field, value := range fv {
+					switch field {
+					case "dst_group":
+						cs.destGroupName = value
+					case "report_type":
+						// The publisher runs these two only; any other type
+						// would dial and never send.
+						if cs.reportType = NewReportType(value); cs.reportType != Periodic && cs.reportType != Stream {
+							return fmt.Errorf("report_type %q is not periodic or stream", value)
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
+						}
+					case "report_interval":
+						intvl, err := strconv.ParseUint(value, 10, 64)
+						// 0 would read and send in a busy loop.
+						if err != nil || intvl == 0 || intvl > maxReportIntervalMs {
+							return fmt.Errorf("report_interval %q is not a number of milliseconds from 1 to %v", value, maxReportIntervalMs)
+						}
+						cs.interval = time.Duration(intvl) * time.Millisecond
+					case "path_target":
+						cs.prefix = &gpb.Path{
+							Target: value,
+						}
+					case "paths":
+						ps := strings.Split(value, ",")
+						newPaths := []*gpb.Path{}
+						for _, p := range ps {
+							pp, err := ygot.StringToPath(p, ygot.StructuredPath)
+							if err != nil {
+								log.V(2).Infof("Invalid paths %v", value)
+								return fmt.Errorf("Invalid paths %v", value)
+							}
+							// append *gpb.Path
+							newPaths = append(newPaths, pp)
+						}
+						cs.paths = newPaths
+					default:
+						log.V(2).Infof("Invalid field %v value %v", field, value)
+						return fmt.Errorf("Invalid field %v value %v", field, value)
+					}
+				}
+<<<<<<< HEAD
 			}
 			log.V(2).Infof("New clientSubscription %v", cs)
 			if cs.destGroupName == "" {
 				// not destination configured, just return
+=======
+				if cs.destGroupName == "" {
+					return fmt.Errorf("no destination group configured")
+				}
+				if cs.prefix.GetTarget() == "" {
+					return fmt.Errorf("no path_target configured")
+				}
+				if len(cs.paths) == 0 {
+					return fmt.Errorf("no paths configured")
+				}
+				// A stream to OTHERS is sampled every report_interval, and its
+				// data client refuses to sample faster than MinSampleInterval.
+				if cs.reportType == Stream && cs.prefix.GetTarget() == "OTHERS" && cs.interval < sdc.MinSampleInterval {
+					return fmt.Errorf("a stream to OTHERS is sampled every report_interval, which cannot be less than %v", sdc.MinSampleInterval)
+				}
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 				return nil
 			}
+			if err := parse(); err != nil {
+				// A row that is refused changes nothing: the registered
+				// entry keeps its old configuration, running or waiting. Only
+				// a row with no destination group stops it: the row is still
+				// refused, and the error says the entry was stopped.
+				if ok && fv["dst_group"] == "" {
+					takeDown(csub)
+					return fmt.Errorf("%v; the subscription under this name is stopped", err)
+				}
+				return err
+			}
+			log.V(2).Infof("New clientSubscription %v", &cs)
+			// The entry parsed. An update whose data source cannot be opened
+			// (a mistyped target, a database that does not answer) is refused
+			// while an instance is serving, so it keeps serving, and the row
+			// is applied again after RetryInterval. Otherwise the replaced
+			// instance is taken down, and taken off its old group's list if
+			// the group changed. A group not in CONFIG_DB yet is not refused:
+			// rows may arrive in any order, so the entry waits for its group.
+			if ok {
+				if csub.serving() {
+					if err := cs.sourceError(ctx); err != nil {
+						retryEditLater(runCtx, redisDb, key, name)
+						return fmt.Errorf("%v; the running instance is kept and the row applied again in %v", err, clientCfg.RetryInterval)
+					}
+				}
+				takeDown(csub)
+			}
 
+<<<<<<< HEAD
 			var found bool
 			for _, na := range DestGrp2ClientSubMap[cs.destGroupName] {
 				if na == cs.name {
@@ -657,11 +1039,49 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 			ClientSubscriptionNameMap[cs.name] = &cs
 			log.V(2).Infof("NewInstance with Subscription change for %s to %s", cs.name, cs.destGroupName)
 			cs.NewInstance(ctx)
+=======
+			DestGrp2ClientSubMap[cs.destGroupName] = append(DestGrp2ClientSubMap[cs.destGroupName], cs.name)
+			kept = true
+			ClientSubscriptionNameMap[cs.name] = &cs
+			log.V(2).Infof("NewInstance with Subscription change for %s to %s", cs.name, cs.destGroupName)
+			if err := cs.NewInstance(ctx, *clientCfg); err != nil {
+				// The row stays registered: a group that does not exist
+				// yet starts it when its row arrives.
+				log.V(1).Infof("Subscription %v is registered but not started: %v", cs.name, err)
+			}
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 		}
 	}
 	return nil
 }
 
+<<<<<<< HEAD
+=======
+// resetClientSubscriptions stops every running instance and empties the
+// configuration tables.
+func resetClientSubscriptions() {
+	configMu.Lock()
+	defer configMu.Unlock()
+	resetLocked()
+}
+
+// resetLocked is resetClientSubscriptions with configMu held.
+func resetLocked() {
+	for name, cs := range ClientSubscriptionNameMap {
+		if cs == nil {
+			continue
+		}
+		closeInstance(cs)
+		delete(ClientSubscriptionNameMap, name)
+	}
+	DestGrp2ClientSubMap = map[string][]string{}
+	destGrpNameMap = map[string][]Destination{}
+	for name := range editRetry {
+		stopEditRetry(name)
+	}
+}
+
+>>>>>>> 944266c (NOS-23562: [dialout_client] Keep a working subscription through a bad edit, and refuse rows that cannot run (#402))
 // read configDB data for telemetry client and start publishing service for client subscription
 func DialOutRun(ctx context.Context, ccfg *ClientConfig) error {
 	clientCfg = ccfg
