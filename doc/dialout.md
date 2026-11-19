@@ -66,11 +66,26 @@ There are three categories of configuration:
   * dst_addr: Multiple IP address plus port number of the collectors may be specified. dialout client will try the next one in a DesistinationGroup if current one got disconnected due to failure.
   Number of DestinationGroups is not limited.
 * Subscription
+<<<<<<< HEAD
   * dst_group: The DestinationGroup to be used by this subscription.
   * path_target: The DB target for this subscription
   * paths:  The list of paths subscribed to in this instance of subscription.
   * report_type: May be one of "periodic", "stream" or "once". "periodic" is the default value
   * report_interval:  How frequent the data for all paths should be sent to collector, in millisecond, default value is "5000".
+=======
+  * dst_group: The DestinationGroup to be used by this subscription. Required. The group may be configured after the subscription, which waits for it. A row without it is refused; when it replaces a running subscription, that subscription is stopped, and the `-v 1` line says so.
+  * path_target: Where the paths are read from: a database (`APPL_DB`, `CONFIG_DB`, `COUNTERS_DB`, `STATE_DB`), `OC_YANG` for OpenConfig paths, or `OTHERS` for the non-database paths such as `proc/uptime`. Required.
+  * paths:  The list of paths subscribed to in this instance of subscription. Required.
+  * report_type: "periodic" or "stream". "periodic" is the default value. A row with any other value is refused whole and reported at `-v 1`; the running subscription is left as it was. "periodic" sends the data for all paths every report_interval. "stream" sends the data for all paths once, then a sync response, then updates, and what an update is depends on path_target:
+    * a database: each change, as it happens.
+    * `OC_YANG`: each change, for a path that is streamed on change; a path that is not is sampled at the interval the switch sets for it. These are the choices a dial-in subscription in `TARGET_DEFINED` mode gets.
+    * `OTHERS`: a sample of every path each report_interval, as a dial-in `SAMPLE` subscription gets.
+  * report_interval: In millisecond, from 1 to 99999999, default value is "5000". A row with any other value is refused whole. For "periodic" it is how often the data for all paths is sent to the collector. For a "stream" to `OTHERS` it is the sampling interval, and a row with less than 1000 is refused whole and reported at `-v 1`. A "stream" to a database or to `OC_YANG` does not use it.
+
+  A "stream" whose paths the data source refuses to subscribe, such as an `OC_YANG` path that cannot be streamed, is stopped and reported as an error in the log. It is not retried; it starts again when the row or its DestinationGroup is edited.
+
+  A Subscription row with no fields, or only the `NULL` placeholder, is a delete. A Subscription row that lacks a required field, or has a field not listed here, or whose name holds the STATE_DB key separator (`|`, which splits the subscription's STATE_DB row key), is refused whole and reported at `-v 1`; a subscription already running under that name is left as it was. An update to a running subscription whose new data source cannot be opened (a mistyped `path_target`, or a database that does not answer) is not applied either: the subscription keeps running with its old configuration, the reason is reported at `-v 1`, and the row is applied again every `retry_interval` until the source opens or the row changes.
+>>>>>>> 015cfdc (NOS-8352: [dialout_client] publish one row per dial-out subscription to STATE_DB (#376))
 
 One example configuration:
 ```
