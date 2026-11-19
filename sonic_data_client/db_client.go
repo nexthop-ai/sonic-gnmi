@@ -311,45 +311,137 @@ func (c *DbClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *sync
 	log.V(1).Infof("Exiting StreamRun routine for Client %v", c)
 }
 
+// pathRun is one run of a subscription routine over the table paths a gNMI
+// path resolved to.
+type pathRun struct {
+	tblPaths []tablePath
+	// synced is called once the first value is queued.
+	synced func()
+	// resolve, when set, is called on each interval tick of the routine with
+	// the table paths of the run. When the gNMI path now resolves to other
+	// table paths, it returns them and true, and the routine returns them so
+	// its caller can start over.
+	resolve func([]tablePath) ([]tablePath, bool)
+}
+
+// resolveAgain resolves the virtual path gnmiPath again, or returns tblPaths
+// when it cannot or gnmiPath is not virtual. A translator error keeps tblPaths
+// rather than falling back to a physical path, which would match nothing.
+func (c *DbClient) resolveAgain(gnmiPath *gnmipb.Path, tblPaths []tablePath) []tablePath {
+	if !isV2RPath(c.prefix, gnmiPath) {
+		return tblPaths
+	}
+	targetDbName, _, _, targetDbNameSpaceExist := IsTargetDb(c.prefix.GetTarget())
+	if targetDbNameSpaceExist {
+		return tblPaths
+	}
+	next, err := lookupV2R(pathElemNames(targetDbName, c.prefix, gnmiPath))
+	if err != nil {
+		log.V(2).Infof("Resolving %v again failed, keeping its table paths: %v", gnmiPath, err)
+		return tblPaths
+	}
+	for i := range next {
+		next[i].isVirtualPath = true
+	}
+	return next
+}
+
+// resolveHook returns the resolve hook of a run of gnmiPath: nil when the path
+// is not virtual, else one that resolves it again at most once per nameMapMaxAge.
+func (c *DbClient) resolveHook(gnmiPath *gnmipb.Path) func([]tablePath) ([]tablePath, bool) {
+	if !isV2RPath(c.prefix, gnmiPath) {
+		return nil
+	}
+	var last time.Time
+	return func(tblPaths []tablePath) ([]tablePath, bool) {
+		now := nameMapNow()
+		if !last.IsZero() && now.Sub(last) < nameMapMaxAge {
+			return tblPaths, false
+		}
+		last = now
+		next := c.resolveAgain(gnmiPath, tblPaths)
+		return next, !sameTablePaths(next, tblPaths)
+	}
+}
+
+// runPath calls subscribe with run, and again with the new table paths each
+// time it returns because gnmiPath now resolves to other table paths.
+func runPath(gnmiPath *gnmipb.Path, run pathRun, subscribe func(pathRun) ([]tablePath, bool)) {
+	for {
+		next, restart := subscribe(run)
+		if !restart {
+			return
+		}
+		log.V(2).Infof("%v now resolves to %v", gnmiPath, next)
+		run.tblPaths = next
+		// synced is c.synced.Done, which the first run called; calling it again
+		// would make the WaitGroup counter negative and panic.
+		run.synced = func() {}
+	}
+}
+
+// sameTablePaths reports whether a and b hold the same table paths in any order.
+func sameTablePaths(a, b []tablePath) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	count := make(map[tablePath]int, len(a))
+	for _, p := range a {
+		count[p]++
+	}
+	for _, p := range b {
+		if count[p] == 0 {
+			return false
+		}
+		count[p]--
+	}
+	return true
+}
+
 // streamOnChangeSubscription implements Subscription "ON_CHANGE STREAM" mode
 func streamOnChangeSubscription(c *DbClient, gnmiPath *gnmipb.Path) {
-	tblPaths := c.pathG2S[gnmiPath]
+	defer c.w.Done()
+	run := pathRun{tblPaths: c.pathG2S[gnmiPath], synced: c.synced.Done, resolve: c.resolveHook(gnmiPath)}
 	log.V(2).Infof("streamOnChangeSubscription gnmiPath: %v", gnmiPath)
 
-	if len(tblPaths) > 0 && tblPaths[0].field != "" {
-		if len(tblPaths) > 1 {
-			go dbFieldMultiSubscribe(c, gnmiPath, true, time.Millisecond*200, false)
-		} else {
-			go dbFieldSubscribe(c, gnmiPath, true, time.Millisecond*200)
+	runPath(gnmiPath, run, func(run pathRun) ([]tablePath, bool) {
+		tblPaths := run.tblPaths
+		if len(tblPaths) > 0 && tblPaths[0].field != "" {
+			if len(tblPaths) > 1 {
+				return dbFieldMultiSubscribe(c, gnmiPath, run, true, time.Millisecond*200, false)
+			}
+			return dbFieldSubscribe(c, gnmiPath, run, true, time.Millisecond*200)
 		}
-	} else {
 		// sample interval and update only parameters are not applicable
-		go dbTableKeySubscribe(c, gnmiPath, 0, true)
-	}
+		return dbTableKeySubscribe(c, gnmiPath, run, 0, true)
+	})
 }
 
 // streamSampleSubscription implements Subscription "SAMPLE STREAM" mode
 func streamSampleSubscription(c *DbClient, sub *gnmipb.Subscription, updateOnly bool) {
+	defer c.w.Done()
 	samplingInterval, err := validateSampleInterval(sub)
 	if err != nil {
 		enqueueFatalMsg(c, err.Error())
 		c.synced.Done()
-		c.w.Done()
 		return
 	}
 
 	gnmiPath := sub.GetPath()
-	tblPaths := c.pathG2S[gnmiPath]
+	run := pathRun{tblPaths: c.pathG2S[gnmiPath], synced: c.synced.Done, resolve: c.resolveHook(gnmiPath)}
 	log.V(2).Infof("streamSampleSubscription gnmiPath: %v", gnmiPath)
-	if len(tblPaths) > 0 && tblPaths[0].field != "" {
-		if len(tblPaths) > 1 {
-			dbFieldMultiSubscribe(c, gnmiPath, false, samplingInterval, updateOnly)
-		} else {
-			dbFieldSubscribe(c, gnmiPath, false, samplingInterval)
+	// A run whose path resolves to other table paths starts over as a new
+	// subscription would, with the routine that fits them.
+	runPath(gnmiPath, run, func(run pathRun) ([]tablePath, bool) {
+		tblPaths := run.tblPaths
+		if len(tblPaths) > 0 && tblPaths[0].field != "" {
+			if len(tblPaths) > 1 {
+				return dbFieldMultiSubscribe(c, gnmiPath, run, false, samplingInterval, updateOnly)
+			}
+			return dbFieldSubscribe(c, gnmiPath, run, false, samplingInterval)
 		}
-	} else {
-		dbTableKeySubscribe(c, gnmiPath, samplingInterval, updateOnly)
-	}
+		return dbTableKeySubscribe(c, gnmiPath, run, samplingInterval, updateOnly)
+	})
 }
 
 func (c *DbClient) PollRun(q *queue.PriorityQueue, poll chan struct{}, w *sync.WaitGroup, subscribe *gnmipb.SubscriptionList) {
@@ -370,6 +462,8 @@ func (c *DbClient) PollRun(q *queue.PriorityQueue, poll chan struct{}, w *sync.W
 
 		for gnmiPath, tblPaths := range c.pathG2S {
 			pathKey := fmt.Sprintf("%v", gnmiPath)
+			tblPaths = c.resolveAgain(gnmiPath, tblPaths)
+			c.pathG2S[gnmiPath] = tblPaths
 			val, err, updateReceived := subscribeTableData2TypedValue(tblPaths, nil)
 			if !updateReceived { // No updates sent for missing data
 				if prevUpdate, exists := prevUpdates[pathKey]; exists && prevUpdate {
@@ -463,6 +557,9 @@ func (c *DbClient) Get(w *sync.WaitGroup) ([]*spb.Value, error) {
 	var values []*spb.Value
 	ts := time.Now()
 	for gnmiPath, tblPaths := range c.pathG2S {
+		// A client can serve Get more than once.
+		tblPaths = c.resolveAgain(gnmiPath, tblPaths)
+		c.pathG2S[gnmiPath] = tblPaths
 		var val *gnmipb.TypedValue
 		var err error
 		if c.preserveConfigDBTables && isConfigDBWildcard(tblPaths) {
@@ -733,8 +830,35 @@ func populateAllDbtablePath(prefix *gnmipb.Path, paths []*gnmipb.Path, pathG2S *
 	return probePathElements(pathG2S)
 }
 
+// pathElemNames returns the database name followed by the element names of
+// path under prefix.
+func pathElemNames(dbName string, prefix, path *gnmipb.Path) []string {
+	fullPath := path
+	if prefix != nil {
+		fullPath = gnmiFullPath(prefix, path)
+	}
+
+	names := []string{dbName}
+	for i, elem := range fullPath.GetElem() {
+		log.V(6).Infof("index %d elem : %#v %#v", i, elem.GetName(), elem.GetKey())
+		names = append(names, elem.GetName())
+	}
+	return names
+}
+
+// isV2RPath reports whether path is a virtual COUNTERS_DB path, which resolves
+// through name maps that can change while the path is subscribed.
+func isV2RPath(prefix, path *gnmipb.Path) bool {
+	targetDbName, ok, _, _ := IsTargetDb(prefix.GetTarget())
+	if !ok {
+		return false
+	}
+	_, found := v2rTrie.Find(pathElemNames(targetDbName, prefix, path))
+	return found
+}
+
 // parsePath resolves a gNMI path into a tablePath struct and stores it in pathG2S.
-// Handles COUNTERS_DB initialization and V2R virtual path lookup.
+// Handles V2R virtual path lookup.
 // Does NOT make any Redis existence checks — see probePathElements and ensureKeysExistInRedis.
 func parsePath(prefix, path *gnmipb.Path, pathG2S *map[*gnmipb.Path][]tablePath) error {
 	var tblPath tablePath
@@ -753,59 +877,8 @@ func parsePath(prefix, path *gnmipb.Path, pathG2S *map[*gnmipb.Path][]tablePath)
 		return fmt.Errorf("Invalid target dbNameSpace %v", targetDbNameSpace)
 	}
 
-	if targetDbName == "COUNTERS_DB" {
-		err := initCountersPortNameMap()
-		if err != nil {
-			return err
-		}
-		err = initCountersQueueNameMap()
-		if err != nil {
-			return err
-		}
-		err = initCountersPGNameMap()
-		if err != nil {
-			return err
-		}
-		err = initAliasMap()
-		if err != nil {
-			return err
-		}
-		err = initCountersPfcwdNameMap()
-		if err != nil {
-			log.Errorf("Could not create CountersPfcwdNameMap: %v", err)
-		}
-		err = initCountersFabricPortNameMap()
-		if err != nil {
-			log.Errorf("Could not create CountersFabricPortNameMap: %v", err)
-		}
-		err = initDebugNameSwitchStatMap()
-		if err != nil {
-			log.Errorf("Could not create CountersDebugNameSwitchStatMap: %v", err)
-		}
-		err = initCountersAclRuleMap()
-		if err != nil {
-			log.Errorf("Could not create CountersAclRuleMap: %v", err)
-		}
-		err = initCountersVoQNameMap()
-		if err != nil {
-			log.Errorf("Could not create CountersVoQNameMap: %v", err)
-		}
-	}
-
-	fullPath := path
-	if prefix != nil {
-		fullPath = gnmiFullPath(prefix, path)
-	}
-
-	stringSlice := []string{targetDbName}
+	stringSlice := pathElemNames(targetDbName, prefix, path)
 	separator, _ := GetTableKeySeparator(targetDbName, dbNamespace)
-	elems := fullPath.GetElem()
-	if elems != nil {
-		for i, elem := range elems {
-			log.V(6).Infof("index %d elem : %#v %#v", i, elem.GetName(), elem.GetKey())
-			stringSlice = append(stringSlice, elem.GetName())
-		}
-	}
 
 	// First lookup the Virtual path to Real path mapping tree
 	if tblPaths, err := lookupV2R(stringSlice); err == nil {
@@ -819,8 +892,8 @@ func parsePath(prefix, path *gnmipb.Path, pathG2S *map[*gnmipb.Path][]tablePath)
 		log.V(5).Infof("v2r from %v to %+v ", stringSlice, tblPaths)
 		return nil
 	} else {
-		var sidErr *sidMapReadError
-		if errors.As(err, &sidErr) {
+		var mapErr *nameMapReadError
+		if errors.As(err, &mapErr) {
 			return err
 		}
 		log.V(5).Infof("v2r lookup failed for %v %v", stringSlice, err)
@@ -1266,10 +1339,8 @@ func putFatalMsg(q *queue.PriorityQueue, msg string) {
 // For SAMPLE mode, it would send periodically regardless of change.
 // However, if `updateOnly` is true, the payload would include only the changed fields.
 // For ON_CHANGE mode, it would send only if the value has changed since the last update.
-func dbFieldMultiSubscribe(c *DbClient, gnmiPath *gnmipb.Path, onChange bool, interval time.Duration, updateOnly bool) {
-	defer c.w.Done()
-
-	tblPaths := c.pathG2S[gnmiPath]
+func dbFieldMultiSubscribe(c *DbClient, gnmiPath *gnmipb.Path, run pathRun, onChange bool, interval time.Duration, updateOnly bool) ([]tablePath, bool) {
+	tblPaths := run.tblPaths
 
 	// Init the path to value map, it saves the previous value
 	path2ValueMap := make(map[tablePath]string)
@@ -1337,24 +1408,29 @@ func dbFieldMultiSubscribe(c *DbClient, gnmiPath *gnmipb.Path, onChange bool, in
 
 	msi := readVal()
 	if err := sendVal(msi); err != nil {
-		c.synced.Done()
-		return
+		run.synced()
+		return nil, false
 	}
-	c.synced.Done()
+	run.synced()
 
 	intervalTicker := GetIntervalTicker()(interval)
 	for {
 		select {
 		case <-c.channel:
 			log.V(1).Infof("Stopping dbFieldMultiSubscribe routine for Client %s ", c)
-			return
+			return nil, false
 		case <-intervalTicker:
+			if run.resolve != nil {
+				if next, changed := run.resolve(tblPaths); changed {
+					return next, true
+				}
+			}
 			msi := readVal()
 
 			if onChange == false || len(msi) != 0 {
 				if err := sendVal(msi); err != nil {
 					log.Errorf("Queue error:  %v", err)
-					return
+					return nil, false
 				}
 			}
 		}
@@ -1366,10 +1442,8 @@ func dbFieldMultiSubscribe(c *DbClient, gnmiPath *gnmipb.Path, onChange bool, in
 // Handles queries like "COUNTERS/Ethernet0/xyz" where the path translates to a field in a table.
 // For SAMPLE mode, it would send periodically regardless of change.
 // For ON_CHANGE mode, it would send only if the value has changed since the last update.
-func dbFieldSubscribe(c *DbClient, gnmiPath *gnmipb.Path, onChange bool, interval time.Duration) {
-	defer c.w.Done()
-
-	tblPaths := c.pathG2S[gnmiPath]
+func dbFieldSubscribe(c *DbClient, gnmiPath *gnmipb.Path, run pathRun, onChange bool, interval time.Duration) ([]tablePath, bool) {
+	tblPaths := run.tblPaths
 	tblPath := tblPaths[0]
 	// run redis get directly for field value
 	redisDb := Target2RedisDb[tblPath.dbNamespace][tblPath.dbName]
@@ -1419,24 +1493,29 @@ func dbFieldSubscribe(c *DbClient, gnmiPath *gnmipb.Path, onChange bool, interva
 	err := sendVal(val)
 	if err != nil {
 		putFatalMsg(c.q, err.Error())
-		c.synced.Done()
-		return
+		run.synced()
+		return nil, false
 	}
-	c.synced.Done()
+	run.synced()
 
 	intervalTicker := GetIntervalTicker()(interval)
 	for {
 		select {
 		case <-c.channel:
 			log.V(1).Infof("Stopping dbFieldSubscribe routine for Client %s ", c)
-			return
+			return nil, false
 		case <-intervalTicker:
+			if run.resolve != nil {
+				if next, changed := run.resolve(tblPaths); changed {
+					return next, true
+				}
+			}
 			newVal := readVal()
 
 			if onChange == false || newVal != val {
 				if err = sendVal(newVal); err != nil {
 					log.V(1).Infof("Queue error:  %v", err)
-					return
+					return nil, false
 				}
 				val = newVal
 			}
@@ -1452,7 +1531,9 @@ type redisSubData struct {
 }
 
 // TODO: For delete operation, the exact content returned is to be clarified.
-func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan map[string]interface{}) {
+// stop closes when the run that started the routine returns, which can be
+// before the client stops.
+func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan map[string]interface{}, stop <-chan struct{}) {
 	tblPath := rsd.tblPath
 	pubsub := rsd.pubsub
 	prefixLen := rsd.prefixLen
@@ -1473,7 +1554,7 @@ func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan
 				}
 
 				// Do not log errors if stop is signaled
-				if _, activeCh := <-c.channel; activeCh {
+				if _, activeCh := <-stop; activeCh {
 					log.V(2).Infof("pubsub.ReceiveTimeout err %v", err)
 				}
 
@@ -1527,10 +1608,15 @@ func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan
 			}
 
 			if len(newMsi) > 0 {
-				updateChannel <- newMsi
+				select {
+				case updateChannel <- newMsi:
+				case <-stop:
+					log.V(2).Infof("Stopping dbSingleTableKeySubscribe routine for %+v", tblPath)
+					return
+				}
 			}
 
-		case <-c.channel:
+		case <-stop:
 			log.V(2).Infof("Stopping dbSingleTableKeySubscribe routine for %+v", tblPath)
 			return
 		}
@@ -1540,10 +1626,8 @@ func dbSingleTableKeySubscribe(c *DbClient, rsd redisSubData, updateChannel chan
 // dbTableKeySubscribe subscribes to tables using a table keys.
 // Handles queries like "COUNTERS/Ethernet0" or "COUNTERS/Ethernet*"
 // This function handles both ON_CHANGE and SAMPLE modes. "interval" being 0 is interpreted as ON_CHANGE mode.
-func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Duration, updateOnly bool) {
-	defer c.w.Done()
-
-	tblPaths := c.pathG2S[gnmiPath]
+func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, run pathRun, interval time.Duration, updateOnly bool) ([]tablePath, bool) {
+	tblPaths := run.tblPaths
 	msiAll := make(map[string]interface{})
 	rsdList := []redisSubData{}
 	synced := false
@@ -1551,7 +1635,7 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 	// Helper to signal sync
 	signalSync := func() {
 		if !synced {
-			c.synced.Done()
+			run.synced()
 			synced = true
 		}
 	}
@@ -1610,19 +1694,19 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 		msgi, err := pubsub.ReceiveTimeout(context.Background(), time.Second)
 		if err != nil {
 			handleFatalMsg(fmt.Sprintf("psubscribe to %s failed for %v", pattern, tblPath))
-			return
+			return nil, false
 		}
 		subscr := msgi.(*redis.Subscription)
 		if subscr.Channel != pattern {
 			handleFatalMsg(fmt.Sprintf("psubscribe to %s failed for %v", pattern, tblPath))
-			return
+			return nil, false
 		}
 		log.V(2).Infof("Psubscribe succeeded for %v: %v", tblPath, subscr)
 
 		err = TableData2Msi(&tblPath, false, nil, &msiAll)
 		if err != nil {
 			handleFatalMsg(err.Error())
-			return
+			return nil, false
 		}
 		rsd := redisSubData{
 			tblPath:   tblPath,
@@ -1635,7 +1719,7 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 	// Send all available data and signal the synced flag.
 	if err := sendMsiData(msiAll); err != nil {
 		handleFatalMsg(err.Error())
-		return
+		return nil, false
 	}
 	signalSync()
 
@@ -1644,10 +1728,13 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 		msiAll = make(map[string]interface{})
 	}
 
-	// Start routines to listen on the table changes.
+	// Start routines to listen on the table changes. They stop when this run
+	// returns, which can be before the client stops.
 	updateChannel := make(chan map[string]interface{})
+	runStop := make(chan struct{})
+	defer close(runStop)
 	for _, rsd := range rsdList {
-		go dbSingleTableKeySubscribe(c, rsd, updateChannel)
+		go dbSingleTableKeySubscribe(c, rsd, updateChannel, runStop)
 	}
 
 	// Listen on updates from tables.
@@ -1656,16 +1743,28 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 	if interval > 0 {
 		intervalTicker = GetIntervalTicker()(interval)
 	}
+	// An on-change run has no interval ticker to resolve its path again on. Its
+	// own ticks are nameMapMaxAge apart, so it calls resolveAgain directly: the
+	// throttle in run.resolve would skip a tick that comes a little early.
+	resolveTicker := make(<-chan time.Time)
+	if interval == 0 && run.resolve != nil {
+		resolveTicker = GetIntervalTicker()(nameMapMaxAge)
+	}
 
 	for {
 		select {
+		case <-resolveTicker:
+			if next := c.resolveAgain(gnmiPath, tblPaths); !sameTablePaths(next, tblPaths) {
+				return next, true
+			}
+			resolveTicker = GetIntervalTicker()(nameMapMaxAge)
 		case updatedTable := <-updateChannel:
 			log.V(6).Infof("update received: %v", updatedTable)
 			if interval == 0 {
 				// on-change mode, send the updated data.
 				if err := sendMsiData(updatedTable); err != nil {
 					handleFatalMsg(err.Error())
-					return
+					return nil, false
 				}
 			} else {
 				// Update the overall table, it will be sent when the interval ticks.
@@ -1675,10 +1774,15 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 			}
 		case <-intervalTicker:
 			log.V(6).Infof("ticker received: %v", len(msiAll))
+			if run.resolve != nil {
+				if next, changed := run.resolve(tblPaths); changed {
+					return next, true
+				}
+			}
 
 			if err := sendMsiData(msiAll); err != nil {
 				handleFatalMsg(err.Error())
-				return
+				return nil, false
 			}
 
 			// Clear the payload so that next time it will send only updates
@@ -1692,7 +1796,7 @@ func dbTableKeySubscribe(c *DbClient, gnmiPath *gnmipb.Path, interval time.Durat
 
 		case <-c.channel:
 			log.V(1).Infof("Stopping dbTableKeySubscribe routine for %v ", c.pathG2S)
-			return
+			return nil, false
 		}
 	}
 }

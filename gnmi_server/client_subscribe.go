@@ -227,7 +227,7 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 	}
 
 	if err != nil {
-		return grpc.Errorf(codes.NotFound, "%v", err)
+		return grpc.Errorf(clientErrorCode(err), "%v", err)
 	}
 
 	defer dc.Close()

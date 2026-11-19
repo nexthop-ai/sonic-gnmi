@@ -10632,3 +10632,48 @@ elem: <name: "lag-type">
 			Update)
 	})
 }
+
+// A COUNTERS_DB path whose name map cannot be read gets Unavailable, which a
+// collector can retry, rather than NotFound.
+func TestGnmiNameMapReadErrorIsUnavailable(t *testing.T) {
+	s := createServer(t, 8081)
+	go runServer(t, s)
+	defer s.Stop()
+
+	mock := gomonkey.ApplyFunc(sdc.GetCountersMap, func(string) (map[string]string, error) {
+		return nil, fmt.Errorf("mock redis error")
+	})
+	defer mock.Reset()
+	sdc.ClearMappings()
+	defer sdc.ClearMappings()
+
+	tlsConfig := &tls.Config{InsecureSkipVerify: true}
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))}
+	targetAddr := "127.0.0.1:8081"
+	conn, err := grpc.Dial(targetAddr, opts...)
+	if err != nil {
+		t.Fatalf("Dialing to %q failed: %v", targetAddr, err)
+	}
+	defer conn.Close()
+	gClient := pb.NewGNMIClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	runTestGet(t, ctx, gClient, "COUNTERS_DB", `elem: <name: "COUNTERS" > elem: <name: "Ethernet0" >`, codes.Unavailable, nil, false)
+
+	stream, err := gClient.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	err = stream.Send(&pb.SubscribeRequest{Request: &pb.SubscribeRequest_Subscribe{Subscribe: &pb.SubscriptionList{
+		Prefix:       &pb.Path{Target: "COUNTERS_DB"},
+		Mode:         pb.SubscriptionList_POLL,
+		Subscription: []*pb.Subscription{{Path: &pb.Path{Elem: []*pb.PathElem{{Name: "COUNTERS"}, {Name: "Ethernet0"}}}}},
+	}}})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, err := stream.Recv(); status.Code(err) != codes.Unavailable {
+		t.Errorf("Subscribe got %v, want code %v", err, codes.Unavailable)
+	}
+}

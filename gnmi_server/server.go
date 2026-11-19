@@ -1036,6 +1036,15 @@ func nativeSetTarget(prefix *gnmipb.Path, paths []*gnmipb.Path) string {
 	return target
 }
 
+// clientErrorCode is the status for a data client that could not be created:
+// Unavailable when a COUNTERS_DB name map could not be read, else NotFound.
+func clientErrorCode(err error) codes.Code {
+	if sdc.IsNameMapReadError(err) {
+		return codes.Unavailable
+	}
+	return codes.NotFound
+}
+
 // Get implements the Get RPC in gNMI spec.
 func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetResponse, error) {
 	common_utils.IncCounter(common_utils.GNMI_GET)
@@ -1124,7 +1133,7 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
-		return nil, status.Error(codes.NotFound, err.Error())
+		return nil, status.Error(clientErrorCode(err), err.Error())
 	}
 	defer dc.Close()
 

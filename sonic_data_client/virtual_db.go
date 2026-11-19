@@ -2,10 +2,12 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	sdcfg "github.com/sonic-net/sonic-gnmi/sonic_db_config"
 
@@ -34,52 +36,6 @@ type pathTransFunc struct {
 
 var (
 	v2rTrie *Trie
-
-	// Port name to oid map in COUNTERS table of COUNTERS_DB
-	countersPortNameMap = make(map[string]string)
-
-	// Queue name to oid map in COUNTERS table of COUNTERS_DB
-	countersQueueNameMap = make(map[string]string)
-
-	// VoQ name to oid map in COUNTERS table of COUNTERS_DB
-	countersVoQNameMap = make(map[string]string)
-
-	// VoQ OID to namespace map (which Redis namespace holds the counter data for each OID)
-	countersVoQOidNamespaceMap = make(map[string]string)
-
-	// ACL table:rule name to oid map in COUNTERS table of COUNTERS_DB
-	countersAclRuleMap = make(map[string]string)
-
-	// SONiC interface name to priority group indices and then to oid (from COUNTERS table of COUNTERS_DB)
-	countersPGNameMap = make(map[string]map[string]string)
-
-	// Alias translation: from vendor port name to sonic interface name
-	alias2nameMap = make(map[string]string)
-	// Alias translation: from sonic interface name to vendor port name
-	name2aliasMap = make(map[string]string)
-	// Map of sonic interface name to namespace
-	port2namespaceMap = make(map[string]string)
-
-	// SONiC interface name to their PFC-WD enabled queues, then to oid map
-	countersPfcwdNameMap = make(map[string]map[string]string)
-
-	// SONiC interface name to their Fabric port name map, then to oid map
-	countersFabricPortNameMap = make(map[string]string)
-
-	// SONiC Switch ID to Switch Stat packet integrity drop counters
-	countersDebugNameSwitchStatMap = make(map[string]string)
-
-	// sync.Once guards for each init function
-	initCountersPortNameMapOnce       sync.Once
-	initCountersQueueNameMapOnce      sync.Once
-	initCountersPGNameMapOnce         sync.Once
-	initCountersAclRuleMapOnce        sync.Once
-	initAliasMapOnce                  sync.Once
-	initCountersPfcwdNameMapOnce      sync.Once
-	initCountersFabricPortNameMapOnce sync.Once
-
-	// Mutex to protect ClearMappings from racing with init functions
-	clearMappingsMu sync.RWMutex
 
 	// path2TFuncTbl is used to populate trie tree which is reponsible
 	// for virtual path to real data path translation
@@ -135,13 +91,15 @@ var (
 	}
 )
 
-// Function variables for map fetching. Init functions call these instead of
+// Function variables for map fetching. The map readers call these instead of
 // the concrete implementations, allowing tests to inject errors.
 var (
 	getCountersMapFn       = func(t string) (map[string]string, error) { return GetCountersMap(t) }
 	getAliasMapFn          = func() (map[string]string, map[string]string, map[string]string, error) { return GetAliasMap() }
 	getFabricCountersMapFn = func(t string) (map[string]string, error) { return GetFabricCountersMap(t) }
 	getPfcwdMapFn          = func() (map[string]map[string]string, error) { return GetPfcwdMap() }
+	getVoQCountersMapFn    = func(t string) (map[string]string, map[string]string, error) { return getVoQCountersMap(t) }
+	getSwitchStatMapFn     = func(t string) (map[string]string, error) { return getSwitchStatMap(t) }
 )
 
 func (t *Trie) v2rTriePopulate() {
@@ -156,95 +114,166 @@ func (t *Trie) v2rTriePopulate() {
 	}
 }
 
-func initCountersQueueNameMap() error {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
-	var initErr error
-	initCountersQueueNameMapOnce.Do(func() {
-		var err error
-		countersQueueNameMap, err = getCountersMapFn("COUNTERS_QUEUE_NAME_MAP")
-		if err != nil {
-			initErr = err
-		}
-	})
-	return initErr
+// nameMapMaxAge is how long a name map serves lookups before the next lookup
+// reads it again. The maps are written after gnmi starts and change while it runs.
+const nameMapMaxAge = time.Second
+
+// nameMapCache holds the name maps that virtual COUNTERS_DB paths resolve
+// through. The maps it returns are shared and must not be changed.
+var nameMapCache = struct {
+	sync.Mutex
+	now     func() time.Time
+	entries map[string]*cachedNameMap
+}{now: time.Now, entries: make(map[string]*cachedNameMap)}
+
+type cachedNameMap struct {
+	sync.Mutex
+	value  any
+	readAt time.Time
+	// triedAt is when value was read, or a read of it last failed.
+	triedAt time.Time
+	loaded  bool
 }
 
-func initCountersPGNameMap() error {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
-	var initErr error
-	initCountersPGNameMapOnce.Do(func() {
+// readNameMap returns the map cached under key, and reads it with read first
+// when it is older than nameMapMaxAge. Other lookups of the same key wait for
+// that read. When the read fails, it returns the map read last and tries again
+// nameMapMaxAge later, or the error when no read of key has succeeded.
+func readNameMap[T any](key string, read func() (T, error)) (T, error) {
+	nameMapCache.Lock()
+	entry, ok := nameMapCache.entries[key]
+	if !ok {
+		entry = &cachedNameMap{}
+		nameMapCache.entries[key] = entry
+	}
+	clock := nameMapCache.now
+	nameMapCache.Unlock()
+
+	entry.Lock()
+	defer entry.Unlock()
+	now := clock()
+	cached, ok := entry.value.(T)
+	ok = ok && entry.loaded
+	if ok && now.Sub(entry.triedAt) < nameMapMaxAge {
+		return cached, nil
+	}
+	value, err := read()
+	if err != nil {
+		if !ok {
+			var none T
+			return none, &nameMapReadError{name: key, err: err}
+		}
+		log.V(2).Infof("Reading %s failed, serving the map read %v ago: %v", key, now.Sub(entry.readAt), err)
+		entry.triedAt = now
+		return cached, nil
+	}
+	entry.value, entry.readAt, entry.triedAt, entry.loaded = value, now, now, true
+	return value, nil
+}
+
+// nameMapNow returns the time on the clock of the name map cache.
+func nameMapNow() time.Time {
+	nameMapCache.Lock()
+	clock := nameMapCache.now
+	nameMapCache.Unlock()
+	return clock()
+}
+
+// resetNameMaps drops every cached name map and the known VoQ counter namespaces.
+func resetNameMaps() {
+	nameMapCache.Lock()
+	nameMapCache.entries = make(map[string]*cachedNameMap)
+	nameMapCache.Unlock()
+	voqCounterNamespaces.Lock()
+	voqCounterNamespaces.byOid = make(map[string]string)
+	voqCounterNamespaces.Unlock()
+}
+
+// readCountersNameMap reads a name to oid map in COUNTERS_DB, such as
+// COUNTERS_PORT_NAME_MAP.
+func readCountersNameMap(tableName string) (map[string]string, error) {
+	return readNameMap(tableName, func() (map[string]string, error) { return getCountersMapFn(tableName) })
+}
+
+type aliasMaps struct {
+	alias2name, name2alias, port2namespace map[string]string
+}
+
+// readAliasMap reads the vendor alias and namespace of each port from
+// CONFIG_DB: alias to port name, port name to alias, and port name to namespace.
+func readAliasMap() (map[string]string, map[string]string, map[string]string, error) {
+	m, err := readNameMap("CONFIG_DB PORT aliases", func() (aliasMaps, error) {
+		alias2name, name2alias, port2namespace, err := getAliasMapFn()
+		return aliasMaps{alias2name, name2alias, port2namespace}, err
+	})
+	return m.alias2name, m.name2alias, m.port2namespace, err
+}
+
+// readCountersPGNameMap reads COUNTERS_PG_NAME_MAP as port name to priority
+// group index to oid.
+func readCountersPGNameMap() (map[string]map[string]string, error) {
+	return readNameMap("COUNTERS_PG_NAME_MAP by port", func() (map[string]map[string]string, error) {
 		pgOidMap, err := getCountersMapFn("COUNTERS_PG_NAME_MAP")
 		if err != nil {
-			initErr = err
-			return
+			return nil, err
 		}
+		countersPGNameMap := make(map[string]map[string]string)
 		for pg, oid := range pgOidMap {
 			// pg is in format of "Ethernet64:7"
 			pg_parts := strings.Split(pg, ":")
 			if len(pg_parts) != 2 {
-				initErr = fmt.Errorf("invalid pg name %v", pg)
-				return
+				return nil, fmt.Errorf("invalid pg name %v", pg)
 			}
 			if _, ok := countersPGNameMap[pg_parts[0]]; !ok {
 				countersPGNameMap[pg_parts[0]] = make(map[string]string)
 			}
 			countersPGNameMap[pg_parts[0]][pg_parts[1]] = oid
 		}
+		return countersPGNameMap, nil
 	})
-	return initErr
 }
 
-func initCountersPortNameMap() error {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
-	var initErr error
-	initCountersPortNameMapOnce.Do(func() {
-		var err error
-		countersPortNameMap, err = getCountersMapFn("COUNTERS_PORT_NAME_MAP")
-		if err != nil {
-			initErr = err
-		}
+// readFabricPortNameMap reads COUNTERS_FABRIC_PORT_NAME_MAP from every namespace.
+func readFabricPortNameMap() (map[string]string, error) {
+	return readNameMap("COUNTERS_FABRIC_PORT_NAME_MAP in every namespace", func() (map[string]string, error) {
+		return getFabricCountersMapFn("COUNTERS_FABRIC_PORT_NAME_MAP")
 	})
-	return initErr
 }
 
-func initCountersAclRuleMap() error {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
-	var initErr error
-	initCountersAclRuleMapOnce.Do(func() {
-		var err error
-		// ACL_COUNTER_RULE_MAP is a hash in COUNTERS_DB:
-		//   "DATAACL:RULE_1" -> "oid:0x9000000000711"
-		countersAclRuleMap, err = getCountersMapFn("ACL_COUNTER_RULE_MAP")
-		if err != nil {
-			initErr = err
-		}
+// readPfcwdNameMap reads the PFC watchdog queues of each port.
+func readPfcwdNameMap() (map[string]map[string]string, error) {
+	return readNameMap("PFC watchdog queues", func() (map[string]map[string]string, error) { return getPfcwdMapFn() })
+}
+
+type voqNameMaps struct {
+	// VoQ name, such as "str2-7804-lc7-1|Asic0|Ethernet84:3", to oid
+	nameToOid map[string]string
+	// VoQ oid to the namespace whose COUNTERS table holds its counters
+	oidToNamespace map[string]string
+}
+
+// readVoQNameMaps reads COUNTERS_VOQ_NAME_MAP from every namespace, and the
+// namespace that holds the counters of each VoQ.
+func readVoQNameMaps() (voqNameMaps, error) {
+	return readNameMap("COUNTERS_VOQ_NAME_MAP in every namespace", func() (voqNameMaps, error) {
+		nameToOid, oidToNamespace, err := getVoQCountersMapFn("COUNTERS_VOQ_NAME_MAP")
+		return voqNameMaps{nameToOid, oidToNamespace}, err
 	})
-	return initErr
 }
 
-func initCountersVoQNameMap() error {
-	clearMappingsMu.RLock()
-	alreadyInit := len(countersVoQNameMap) != 0
-	clearMappingsMu.RUnlock()
-	if alreadyInit {
-		return nil
-	}
-
-	clearMappingsMu.Lock()
-	defer clearMappingsMu.Unlock()
-	if len(countersVoQNameMap) == 0 {
-		var err error
-		countersVoQNameMap, countersVoQOidNamespaceMap, err = getVoQCountersMap("COUNTERS_VOQ_NAME_MAP")
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+// readSwitchStatMap reads COUNTERS_DEBUG_NAME_SWITCH_STAT_MAP from every namespace.
+func readSwitchStatMap() (map[string]string, error) {
+	return readNameMap("COUNTERS_DEBUG_NAME_SWITCH_STAT_MAP in every namespace", func() (map[string]string, error) {
+		return getSwitchStatMapFn("COUNTERS_DEBUG_NAME_SWITCH_STAT_MAP")
+	})
 }
+
+// voqCounterNamespaces holds the namespace found for each VoQ oid by the last
+// getVoQCountersMap, so the next one looks up only the oids it has not found.
+var voqCounterNamespaces = struct {
+	sync.Mutex
+	byOid map[string]string
+}{byOid: make(map[string]string)}
 
 // getVoQCountersMap loads the VoQ name-to-OID map and determines which Redis
 // namespace actually holds the counter data for each OID. On multi-ASIC VoQ
@@ -270,86 +299,48 @@ func getVoQCountersMap(tableName string) (map[string]string, map[string]string, 
 		log.V(6).Infof("tableName: %s in namespace %v, map entries: %d", tableName, namespace, len(fv))
 	}
 
-	// Second pass: determine which namespace has counter data for each OID.
-	// Use SCAN (cursor iteration) instead of KEYS so we don't block the Redis
-	// instance while walking the COUNTERS keyspace on large/production switches.
-	for namespace, redisDb := range redisClientMap {
-		existingOids := make(map[string]bool)
-		iter := redisDb.Scan(context.Background(), 0, "COUNTERS:oid:*", 0).Iterator()
-		for iter.Next(context.Background()) {
-			// "COUNTERS:oid:0x..." -> "oid:0x..."
-			oid := strings.TrimPrefix(iter.Val(), "COUNTERS:")
-			existingOids[oid] = true
-		}
-		if err := iter.Err(); err != nil {
-			log.V(2).Infof("redis Scan failed for COUNTERS:oid:* in namespace %v: %v", namespace, err)
-			continue
-		}
-		for _, oid := range counterMap {
-			if existingOids[oid] {
-				oidNsMap[oid] = namespace
-			}
+	// Second pass: find the namespace whose COUNTERS table has each OID. An OID
+	// keeps the namespace it was found in, so only new OIDs, and ones not found
+	// yet, are looked up.
+	voqCounterNamespaces.Lock()
+	defer voqCounterNamespaces.Unlock()
+	var unknown []string
+	for _, oid := range counterMap {
+		if ns, ok := voqCounterNamespaces.byOid[oid]; ok && redisClientMap[ns] != nil {
+			oidNsMap[oid] = ns
+		} else {
+			unknown = append(unknown, oid)
 		}
 	}
+	for namespace, redisDb := range redisClientMap {
+		if len(unknown) == 0 {
+			break
+		}
+		pipe := redisDb.Pipeline()
+		exists := make([]*redis.IntCmd, len(unknown))
+		for i, oid := range unknown {
+			exists[i] = pipe.Exists(context.Background(), "COUNTERS:"+oid)
+		}
+		// a failed command is reported through its own result below
+		pipe.Exec(context.Background())
+		var notFound []string
+		for i, oid := range unknown {
+			n, err := exists[i].Result()
+			if err != nil {
+				log.V(2).Infof("redis Exists failed for COUNTERS:%v in namespace %v: %v", oid, namespace, err)
+			}
+			if n == 1 {
+				oidNsMap[oid] = namespace
+			} else {
+				notFound = append(notFound, oid)
+			}
+		}
+		unknown = notFound
+	}
+	voqCounterNamespaces.byOid = oidNsMap
 
 	log.V(4).Infof("getVoQCountersMap: %d VoQ entries, %d OID-namespace mappings", len(counterMap), len(oidNsMap))
 	return counterMap, oidNsMap, nil
-}
-
-func initAliasMap() error {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
-	var initErr error
-	initAliasMapOnce.Do(func() {
-		var err error
-		alias2nameMap, name2aliasMap, port2namespaceMap, err = getAliasMapFn()
-		if err != nil {
-			initErr = err
-		}
-	})
-	return initErr
-}
-
-func initCountersPfcwdNameMap() error {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
-	var initErr error
-	initCountersPfcwdNameMapOnce.Do(func() {
-		var err error
-		countersPfcwdNameMap, err = getPfcwdMapFn()
-		if err != nil {
-			initErr = err
-		}
-	})
-	return initErr
-}
-
-func initCountersFabricPortNameMap() error {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
-	var initErr error
-	initCountersFabricPortNameMapOnce.Do(func() {
-		var err error
-		countersFabricPortNameMap, err = getFabricCountersMapFn("COUNTERS_FABRIC_PORT_NAME_MAP")
-		if err != nil {
-			initErr = err
-		}
-	})
-	return initErr
-}
-
-func initDebugNameSwitchStatMap() error {
-	var err error
-	// Reset map for Unit test to ensure that counters db is updated
-	// after changing from single to multi-asic config
-	value := os.Getenv("UNIT_TEST")
-	if len(countersDebugNameSwitchStatMap) == 0 || value == "1" {
-		countersDebugNameSwitchStatMap, err = getSwitchStatMap("COUNTERS_DEBUG_NAME_SWITCH_STAT_MAP")
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // Get the mapping between sonic interface name and oids of their PFC-WD enabled queues in COUNTERS_DB
@@ -436,6 +427,10 @@ func GetPfcwdMap() (map[string]map[string]string, error) {
 			}
 		}
 
+		countersQueueNameMap, err := readCountersNameMap("COUNTERS_QUEUE_NAME_MAP")
+		if err != nil {
+			return nil, err
+		}
 		if len(countersQueueNameMap) == 0 {
 			log.V(1).Infof("COUNTERS_QUEUE_NAME_MAP is empty")
 			return nil, nil
@@ -484,8 +479,20 @@ func GetAliasMap() (map[string]string, map[string]string, map[string]string, err
 			log.V(1).Infof("redis get keys failed for %v in namsepace %v, key = %v, err: %v", dbName, namespace, keyName, err)
 			return nil, nil, nil, err
 		}
-		for _, key := range resp {
-			alias, err := redisDb.HGet(context.Background(), key, "alias").Result()
+		pipe := redisDb.Pipeline()
+		aliasCmds := make([]*redis.StringCmd, len(resp))
+		for i, key := range resp {
+			aliasCmds[i] = pipe.HGet(context.Background(), key, "alias")
+		}
+		// a failed command is reported through its own result below
+		pipe.Exec(context.Background())
+		for i, key := range resp {
+			alias, err := aliasCmds[i].Result()
+			if err == redis.Nil {
+				// the port was deleted after KEYS, or has no alias
+				log.V(2).Infof("%v in namespace %v has no alias, skipping it", key, namespace)
+				continue
+			}
 			if err != nil {
 				log.V(1).Infof("redis get field alias failed for %v in namsepace %v, key = %v, err: %v", dbName, namespace, key, err)
 				// redis get alias failed so return nil for maps and the error
@@ -510,7 +517,6 @@ func addmap(a map[string]string, b map[string]string) {
 }
 
 // Get the mapping between objects in counters DB, Ex. port name to oid in "COUNTERS_PORT_NAME_MAP" table.
-// Aussuming static port name to oid map in COUNTERS table
 func GetCountersMap(tableName string) (map[string]string, error) {
 	counter_map := make(map[string]string)
 	dbName := "COUNTERS_DB"
@@ -531,7 +537,6 @@ func GetCountersMap(tableName string) (map[string]string, error) {
 }
 
 // Get the mapping between objects in counters DB, Ex. port name to oid in "COUNTERS_FABRIC_PORT_NAME_MAP" table.
-// Aussuming static port name to oid map in COUNTERS table
 func GetFabricCountersMap(tableName string) (map[string]string, error) {
 	counter_map := make(map[string]string)
 	dbName := "COUNTERS_DB"
@@ -565,8 +570,10 @@ func GetFabricCountersMap(tableName string) (map[string]string, error) {
 // Populate real data paths from paths like
 // [COUNTER_DB COUNTERS PORT*] or [COUNTER_DB COUNTERS PORT0]
 func v2rFabricPortStats(paths []string) ([]tablePath, error) {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+	countersFabricPortNameMap, err := readFabricPortNameMap()
+	if err != nil {
+		return nil, err
+	}
 	var tblPaths []tablePath
 	if strings.HasSuffix(paths[KeyIdx], "*") { // All Ethernet ports
 		for port, oid := range countersFabricPortNameMap {
@@ -649,6 +656,10 @@ func getSwitchStatMap(tableName string) (map[string]string, error) {
 // Populate real data paths from paths like
 // [COUNTER_DB COUNTERS PORT*] or [COUNTER_DB COUNTERS PORT0]
 func v2rSwitchPacketIntegrityDrop(paths []string) ([]tablePath, error) {
+	countersDebugNameSwitchStatMap, err := readSwitchStatMap()
+	if err != nil {
+		return nil, err
+	}
 	var tblPaths []tablePath
 	if strings.HasSuffix(paths[KeyIdx], "*") { // All Ethernet ports
 		for port, oid := range countersDebugNameSwitchStatMap {
@@ -699,8 +710,14 @@ func v2rSwitchPacketIntegrityDrop(paths []string) ([]tablePath, error) {
 // Populate real data paths from paths like
 // [COUNTER_DB COUNTERS Ethernet*] or [COUNTER_DB COUNTERS Ethernet68]
 func v2rEthPortStats(paths []string) ([]tablePath, error) {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+	countersPortNameMap, err := readCountersNameMap("COUNTERS_PORT_NAME_MAP")
+	if err != nil {
+		return nil, err
+	}
+	alias2nameMap, name2aliasMap, port2namespaceMap, err := readAliasMap()
+	if err != nil {
+		return nil, err
+	}
 	var tblPaths []tablePath
 	if strings.HasSuffix(paths[KeyIdx], "*") { // All Ethernet ports
 		for port, oid := range countersPortNameMap {
@@ -711,9 +728,9 @@ func v2rEthPortStats(paths []string) ([]tablePath, error) {
 				log.V(2).Infof("%v does not have a vendor alias", port)
 				oport = port
 			}
-			namespace, ok := port2namespaceMap[port]
+			namespace, ok := wildcardPortNamespace(port2namespaceMap, port)
 			if !ok {
-				return nil, fmt.Errorf("%v does not have namespace associated", port)
+				continue
 			}
 			separator, _ := GetTableKeySeparator(paths[DbIdx], namespace)
 			tblPath := tablePath{
@@ -758,13 +775,19 @@ func v2rEthPortStats(paths []string) ([]tablePath, error) {
 // [COUNTERS_DB INTERFACE_COUNTERS] to per-interface counter entries from the
 // underlying COUNTERS table, keyed by SONiC interface name (e.g. "Ethernet0").
 func v2rInterfaceCountersStats(paths []string) ([]tablePath, error) {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+	countersPortNameMap, err := readCountersNameMap("COUNTERS_PORT_NAME_MAP")
+	if err != nil {
+		return nil, err
+	}
+	_, _, port2namespaceMap, err := readAliasMap()
+	if err != nil {
+		return nil, err
+	}
 	var tblPaths []tablePath
 	for port, oid := range countersPortNameMap {
-		namespace, ok := port2namespaceMap[port]
+		namespace, ok := wildcardPortNamespace(port2namespaceMap, port)
 		if !ok {
-			return nil, fmt.Errorf("%v does not have namespace associated", port)
+			continue
 		}
 		separator, _ := GetTableKeySeparator(paths[DbIdx], namespace)
 		tblPath := tablePath{
@@ -792,8 +815,14 @@ func v2rInterfaceCountersStats(paths []string) ([]tablePath, error) {
 //
 // case of "*" field could be covered in v2rEthPortStats()
 func v2rEthPortFieldStats(paths []string) ([]tablePath, error) {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+	countersPortNameMap, err := readCountersNameMap("COUNTERS_PORT_NAME_MAP")
+	if err != nil {
+		return nil, err
+	}
+	alias2nameMap, name2aliasMap, port2namespaceMap, err := readAliasMap()
+	if err != nil {
+		return nil, err
+	}
 	var tblPaths []tablePath
 	if strings.HasSuffix(paths[KeyIdx], "*") {
 		for port, oid := range countersPortNameMap {
@@ -804,9 +833,9 @@ func v2rEthPortFieldStats(paths []string) ([]tablePath, error) {
 				log.V(2).Infof("%v dose not have a vendor alias", port)
 				oport = port
 			}
-			namespace, ok := port2namespaceMap[port]
+			namespace, ok := wildcardPortNamespace(port2namespaceMap, port)
 			if !ok {
-				return nil, fmt.Errorf("%v does not have namespace associated", port)
+				continue
 			}
 			separator, _ := GetTableKeySeparator(paths[DbIdx], namespace)
 			tblPath := tablePath{
@@ -853,14 +882,24 @@ func v2rEthPortFieldStats(paths []string) ([]tablePath, error) {
 // Populate real data paths from paths like
 // [COUNTER_DB COUNTERS Ethernet* Pfcwd] or [COUNTER_DB COUNTERS Ethernet68 Pfcwd]
 func v2rEthPortPfcwdStats(paths []string) ([]tablePath, error) {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+	countersPortNameMap, err := readCountersNameMap("COUNTERS_PORT_NAME_MAP")
+	if err != nil {
+		return nil, err
+	}
+	alias2nameMap, name2aliasMap, port2namespaceMap, err := readAliasMap()
+	if err != nil {
+		return nil, err
+	}
+	countersPfcwdNameMap, err := readPfcwdNameMap()
+	if err != nil {
+		return nil, err
+	}
 	var tblPaths []tablePath
 	if strings.HasSuffix(paths[KeyIdx], "*") { // Pfcwd on all Ethernet ports
 		for port, pfcqueues := range countersPfcwdNameMap {
-			namespace, ok := port2namespaceMap[port]
+			namespace, ok := wildcardPortNamespace(port2namespaceMap, port)
 			if !ok {
-				return nil, fmt.Errorf("%v does not have namespace associated", port)
+				continue
 			}
 			separator, _ := GetTableKeySeparator(paths[DbIdx], namespace)
 			for pfcque, oid := range pfcqueues {
@@ -940,8 +979,14 @@ func buildTablePath(namespace, dbName, tableName, tableKey, separator, field, js
 // Populate real data paths from paths like
 // [COUNTERS_DB COUNTERS Ethernet* Queues] or [COUNTERS_DB COUNTERS Ethernet68 Queues]
 func v2rEthPortQueStats(paths []string) ([]tablePath, error) {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+	countersQueueNameMap, err := readCountersNameMap("COUNTERS_QUEUE_NAME_MAP")
+	if err != nil {
+		return nil, err
+	}
+	alias2nameMap, name2aliasMap, port2namespaceMap, err := readAliasMap()
+	if err != nil {
+		return nil, err
+	}
 	// paths[DbIdx] = "COUNTERS_DB"
 	separator, _ := GetTableKeySeparator(paths[DbIdx], "")
 	field := "SAI_QUEUE_STAT_SHARED_WATERMARK_BYTES"
@@ -956,9 +1001,9 @@ func v2rEthPortQueStats(paths []string) ([]tablePath, error) {
 				log.V(2).Infof(" %v dose not have a vendor alias", names[0])
 				oname = names[0]
 			}
-			namespace, ok := port2namespaceMap[names[0]]
+			namespace, ok := wildcardPortNamespace(port2namespaceMap, names[0])
 			if !ok {
-				return nil, fmt.Errorf("%v does not have namespace associated", names[0])
+				continue
 			}
 			que = strings.Join([]string{oname, names[1]}, separator)
 			// que is in format of "Internal_Ethernet:12"
@@ -1008,23 +1053,29 @@ func v2rEthPortQueStats(paths []string) ([]tablePath, error) {
 	return tblPaths, nil
 }
 
-// sidMapReadError distinguishes a failed Redis read from an unmatched virtual
-// path, which may otherwise fall back to a physical database path.
-type sidMapReadError struct {
-	err error
+// nameMapReadError distinguishes a name map that could not be read from an
+// unmatched virtual path, which may otherwise fall back to a physical database path.
+type nameMapReadError struct {
+	name string
+	err  error
 }
 
-func (e *sidMapReadError) Error() string { return e.err.Error() }
-func (e *sidMapReadError) Unwrap() error { return e.err }
+func (e *nameMapReadError) Error() string { return fmt.Sprintf("read %s: %v", e.name, e.err) }
+func (e *nameMapReadError) Unwrap() error { return e.err }
+
+// IsNameMapReadError reports whether err comes from a COUNTERS_DB name map
+// that could not be read, which can succeed on a later attempt.
+func IsNameMapReadError(err error) bool {
+	var mapErr *nameMapReadError
+	return errors.As(err, &mapErr)
+}
 
 // Populate real data paths from paths like
 // [COUNTERS_DB COUNTERS SID*] or [COUNTERS_DB COUNTERS SID:fcbb:bbbb:1::/48]
 func v2rSRv6SidStats(paths []string) ([]tablePath, error) {
-	// SID mappings can appear after the first query. Use one local snapshot per
-	// lookup rather than caching an empty or stale map for the process lifetime.
-	countersSidMap, err := getCountersMapFn("COUNTERS_SRV6_NAME_MAP")
+	countersSidMap, err := readCountersNameMap("COUNTERS_SRV6_NAME_MAP")
 	if err != nil {
-		return nil, &sidMapReadError{err: err}
+		return nil, err
 	}
 	var tblPaths []tablePath
 	if strings.HasSuffix(paths[KeyIdx], "*") { // All SID Counters
@@ -1070,8 +1121,12 @@ func v2rSRv6SidStats(paths []string) ([]tablePath, error) {
 // [COUNTERS_DB COUNTERS ACL_RULE*] or
 // [COUNTERS_DB COUNTERS ACL_RULE:DATAACL:RULE_1]
 func v2rAclRuleStats(paths []string) ([]tablePath, error) {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+	// ACL_COUNTER_RULE_MAP is a hash in COUNTERS_DB:
+	//   "DATAACL:RULE_1" -> "oid:0x9000000000711"
+	countersAclRuleMap, err := readCountersNameMap("ACL_COUNTER_RULE_MAP")
+	if err != nil {
+		return nil, err
+	}
 	var tblPaths []tablePath
 
 	// Wildcard: list all ACL rules in the map
@@ -1122,14 +1177,20 @@ func v2rAclRuleStats(paths []string) ([]tablePath, error) {
 // [COUNTERS_DB PORT_PHY_ATTR Ethernet*] or [COUNTERS_DB PORT_PHY_ATTR Ethernet68]
 // Unlike v2rEthPortStats, this does NOT apply vendor alias translation.
 func v2rPortPhyAttrStats(paths []string) ([]tablePath, error) {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+	countersPortNameMap, err := readCountersNameMap("COUNTERS_PORT_NAME_MAP")
+	if err != nil {
+		return nil, err
+	}
+	_, _, port2namespaceMap, err := readAliasMap()
+	if err != nil {
+		return nil, err
+	}
 	var tblPaths []tablePath
 	if strings.HasSuffix(paths[KeyIdx], "*") { // All Ethernet ports
 		for port, oid := range countersPortNameMap {
-			namespace, ok := port2namespaceMap[port]
+			namespace, ok := wildcardPortNamespace(port2namespaceMap, port)
 			if !ok {
-				return nil, fmt.Errorf("%v does not have namespace associated", port)
+				continue
 			}
 			separator, _ := GetTableKeySeparator(paths[DbIdx], namespace)
 			tblPath := tablePath{
@@ -1170,14 +1231,20 @@ func v2rPortPhyAttrStats(paths []string) ([]tablePath, error) {
 // [COUNTERS_DB PORT_PHY_ATTR Ethernet68 phy_rx_signal_detect]
 // Unlike v2rEthPortFieldStats, this does NOT apply vendor alias translation.
 func v2rPortPhyAttrFieldStats(paths []string) ([]tablePath, error) {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+	countersPortNameMap, err := readCountersNameMap("COUNTERS_PORT_NAME_MAP")
+	if err != nil {
+		return nil, err
+	}
+	_, _, port2namespaceMap, err := readAliasMap()
+	if err != nil {
+		return nil, err
+	}
 	var tblPaths []tablePath
 	if strings.HasSuffix(paths[KeyIdx], "*") {
 		for port, oid := range countersPortNameMap {
-			namespace, ok := port2namespaceMap[port]
+			namespace, ok := wildcardPortNamespace(port2namespaceMap, port)
 			if !ok {
-				return nil, fmt.Errorf("%v does not have namespace associated", port)
+				continue
 			}
 			separator, _ := GetTableKeySeparator(paths[DbIdx], namespace)
 			tblPath := tablePath{
@@ -1216,7 +1283,7 @@ func v2rPortPhyAttrFieldStats(paths []string) ([]tablePath, error) {
 	return tblPaths, nil
 }
 
-func getVendorPortName(port string) string {
+func getVendorPortName(name2aliasMap map[string]string, port string) string {
 	// Get vendor port name from name2aliasMap
 	if alias, ok := name2aliasMap[port]; ok {
 		return alias
@@ -1225,7 +1292,7 @@ func getVendorPortName(port string) string {
 	return port
 }
 
-func getSonicPortName(port string) string {
+func getSonicPortName(alias2nameMap map[string]string, port string) string {
 	// Get sonic port name from alias2nameMap
 	if sonic_name, ok := alias2nameMap[port]; ok {
 		return sonic_name
@@ -1233,7 +1300,7 @@ func getSonicPortName(port string) string {
 	return port
 }
 
-func getPortNamespace(port string) (string, error) {
+func getPortNamespace(port2namespaceMap map[string]string, port string) (string, error) {
 	// Get namespace from port2namespaceMap
 	namespace, ok := port2namespaceMap[port]
 	if !ok {
@@ -1242,12 +1309,26 @@ func getPortNamespace(port string) (string, error) {
 	return namespace, nil
 }
 
-func AliasToPortNameMap() map[string]string {
-	// Ensure alias map is initialized
-	initAliasMap()
+// wildcardPortNamespace returns the namespace of port for a path over all
+// ports, or false to skip a port with none. The port aliases and the counter
+// name maps are read at different times, so a port being added or removed can
+// be in one and not yet in the other.
+func wildcardPortNamespace(port2namespaceMap map[string]string, port string) (string, bool) {
+	namespace, ok := port2namespaceMap[port]
+	if !ok {
+		log.V(2).Infof("%v does not have namespace associated, skipping it", port)
+	}
+	return namespace, ok
+}
 
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+// AliasToPortNameMap returns the port name for each vendor alias, or an empty
+// map when CONFIG_DB cannot be read.
+func AliasToPortNameMap() map[string]string {
+	alias2nameMap, _, _, err := readAliasMap()
+	if err != nil {
+		log.V(2).Infof("Could not read the port aliases: %v", err)
+		return map[string]string{}
+	}
 	output := make(map[string]string, len(alias2nameMap))
 	for alias, portName := range alias2nameMap {
 		output[alias] = portName
@@ -1259,15 +1340,23 @@ func AliasToPortNameMap() map[string]string {
 // [COUNTERS_DB PERIODIC_WATERMARKS Ethernet* PriorityGroups] or
 // [COUNTERS_DB PERIODIC_WATERMARKS Ethernet64 PriorityGroups]
 func v2rEthPortPGPeriodicWMs(paths []string) ([]tablePath, error) {
+	countersPGNameMap, err := readCountersPGNameMap()
+	if err != nil {
+		return nil, err
+	}
+	alias2nameMap, name2aliasMap, port2namespaceMap, err := readAliasMap()
+	if err != nil {
+		return nil, err
+	}
 	// paths[DbIdx] = "COUNTERS_DB"
 	separator, _ := GetTableKeySeparator(paths[DbIdx], "")
 	var tblPaths []tablePath
 	if strings.HasSuffix(paths[KeyIdx], "*") { // priority groups on all Ethernet ports
 		for port, pg_index_to_oid := range countersPGNameMap {
-			vendor_port := getVendorPortName(port)
-			namespace, err := getPortNamespace(port)
-			if err != nil {
-				return nil, err
+			vendor_port := getVendorPortName(name2aliasMap, port)
+			namespace, ok := wildcardPortNamespace(port2namespaceMap, port)
+			if !ok {
+				continue
 			}
 			for pg_index, oid := range pg_index_to_oid {
 				pg := strings.Join([]string{vendor_port, pg_index}, separator)
@@ -1277,8 +1366,8 @@ func v2rEthPortPGPeriodicWMs(paths []string) ([]tablePath, error) {
 			}
 		}
 	} else { // priority groups on a single port
-		port := getSonicPortName(paths[KeyIdx])
-		namespace, err := getPortNamespace(port)
+		port := getSonicPortName(alias2nameMap, paths[KeyIdx])
+		namespace, err := getPortNamespace(port2namespaceMap, port)
 		if err != nil {
 			return nil, err
 		}
@@ -1301,39 +1390,8 @@ func ClearMappings() {
 	if value != "1" {
 		return
 	}
-	clearMappingsMu.Lock()
-	defer clearMappingsMu.Unlock()
-
-	counterMaps := []map[string]string{
-		countersPortNameMap,
-		alias2nameMap,
-		countersFabricPortNameMap,
-		countersQueueNameMap,
-		countersVoQNameMap,
-		countersVoQOidNamespaceMap,
-		countersAclRuleMap,
-	}
-	for _, counterMap := range counterMaps {
-		for entry := range counterMap {
-			delete(counterMap, entry)
-		}
-	}
-
-	// Reset sync.Once guards so the next call re-initializes.
-	initCountersPortNameMapOnce = sync.Once{}
-	initCountersQueueNameMapOnce = sync.Once{}
-	initCountersPGNameMapOnce = sync.Once{}
-	initCountersAclRuleMapOnce = sync.Once{}
-	initAliasMapOnce = sync.Once{}
-	initCountersPfcwdNameMapOnce = sync.Once{}
-	initCountersFabricPortNameMapOnce = sync.Once{}
+	resetNameMaps()
 }
-
-func InitCountersPortNameMap() error       { return initCountersPortNameMap() }
-func InitCountersQueueNameMap() error      { return initCountersQueueNameMap() }
-func InitCountersPGNameMap() error         { return initCountersPGNameMap() }
-func InitCountersAclRuleMap() error        { return initCountersAclRuleMap() }
-func InitCountersFabricPortNameMap() error { return initCountersFabricPortNameMap() }
 
 // parseVoQName parses VoQ name in format "str2-7804-lc7-1|Asic0|Ethernet84:3"
 // Returns: switchId, asicNamespace, interfaceName, voqIndex, error
@@ -1376,13 +1434,8 @@ func buildVoQJsonKey(switchId, asicNamespace, interfaceName, voqIndex string) st
 // Guessing (e.g. deriving from the VoQ name) risks reading the wrong Redis
 // instance (silent empty result) or, on a chassis, naming a non-local namespace
 // that has no Redis client and nil-dereferencing in the reader.
-//
-// Note: the oid-to-namespace ownership map is built once during initialization
-// (see initCountersVoQNameMap) and assumed fixed for the lifetime of the
-// process. If a counter's owning namespace changes (e.g. warm reboot, line-card
-// insert/remove), the mapping must be rebuilt via ClearMappings.
-func resolveVoQNamespace(oid string, activeNamespaces map[string]*redis.Client) (string, bool) {
-	if ns, ok := countersVoQOidNamespaceMap[oid]; ok && activeNamespaces[ns] != nil {
+func resolveVoQNamespace(oidToNamespace map[string]string, oid string, activeNamespaces map[string]*redis.Client) (string, bool) {
+	if ns, ok := oidToNamespace[oid]; ok && activeNamespaces[ns] != nil {
 		return ns, true
 	}
 	return "", false
@@ -1391,8 +1444,10 @@ func resolveVoQNamespace(oid string, activeNamespaces map[string]*redis.Client) 
 // Populate real data paths from paths like
 // [COUNTERS_DB COUNTERS SwitchName* VoQs] or [COUNTERS_DB COUNTERS SwitchName VoQs] or [COUNTERS_DB COUNTERS SwitchName|Asic|Port VoQs]
 func v2rSystemPortVoQStats(paths []string) ([]tablePath, error) {
-	clearMappingsMu.RLock()
-	defer clearMappingsMu.RUnlock()
+	voqMaps, err := readVoQNameMaps()
+	if err != nil {
+		return nil, err
+	}
 	// paths[DbIdx] = "COUNTERS_DB"
 	separator, _ := GetTableKeySeparator(paths[DbIdx], "")
 	// Get the currently active Redis clients for namespace validation
@@ -1401,7 +1456,7 @@ func v2rSystemPortVoQStats(paths []string) ([]tablePath, error) {
 
 	// VoQs on all SwitchName* (str2-7804*)
 	if strings.HasSuffix(paths[KeyIdx], "*") {
-		for voqName, oid := range countersVoQNameMap {
+		for voqName, oid := range voqMaps.nameToOid {
 			switchId, asicNamespace, interfaceName, voqIndex, err := parseVoQName(voqName)
 			if err != nil {
 				log.V(2).Infof("Failed to parse VoQ name %v: %v", voqName, err)
@@ -1410,7 +1465,7 @@ func v2rSystemPortVoQStats(paths []string) ([]tablePath, error) {
 
 			// Look up the namespace where this OID's counter data actually lives.
 			// Skip the VoQ if no active namespace owns it rather than guess.
-			namespace, ok := resolveVoQNamespace(oid, activeNamespaces)
+			namespace, ok := resolveVoQNamespace(voqMaps.oidToNamespace, oid, activeNamespaces)
 			if !ok {
 				log.V(2).Infof("Skipping VoQ %v: no active namespace owns OID %v", voqName, oid)
 				continue
@@ -1433,7 +1488,7 @@ func v2rSystemPortVoQStats(paths []string) ([]tablePath, error) {
 	} else if strings.Contains(paths[KeyIdx], "|") {
 		//VoQs on single SwitchName-SystemPort (str2-7804-lc7-1|Asic0|Ethernet84)
 		// Find all VoQs for this specific interface
-		for voqName, oid := range countersVoQNameMap {
+		for voqName, oid := range voqMaps.nameToOid {
 			// Filter: only process VoQs that match the requested system port exactly
 			if !strings.HasPrefix(voqName, paths[KeyIdx]+":") {
 				continue
@@ -1447,7 +1502,7 @@ func v2rSystemPortVoQStats(paths []string) ([]tablePath, error) {
 
 			// Look up the namespace where this OID's counter data actually lives.
 			// Skip the VoQ if no active namespace owns it rather than guess.
-			namespace, ok := resolveVoQNamespace(oid, activeNamespaces)
+			namespace, ok := resolveVoQNamespace(voqMaps.oidToNamespace, oid, activeNamespaces)
 			if !ok {
 				log.V(2).Infof("Skipping VoQ %v: no active namespace owns OID %v", voqName, oid)
 				continue
@@ -1471,7 +1526,7 @@ func v2rSystemPortVoQStats(paths []string) ([]tablePath, error) {
 		//VoQs on single SwitchName (str2-7804-lc7-1)
 		// Find all VoQs for this specific SwitchName
 		requestedSwitchName := paths[KeyIdx] // e.g., "str2-7804-lc7-1"
-		for voqName, oid := range countersVoQNameMap {
+		for voqName, oid := range voqMaps.nameToOid {
 			// Filter: only process VoQs that match the requested switch name
 			if !strings.HasPrefix(voqName, requestedSwitchName+"|") {
 				continue
@@ -1485,7 +1540,7 @@ func v2rSystemPortVoQStats(paths []string) ([]tablePath, error) {
 
 			// Look up the namespace where this OID's counter data actually lives.
 			// Skip the VoQ if no active namespace owns it rather than guess.
-			namespace, ok := resolveVoQNamespace(oid, activeNamespaces)
+			namespace, ok := resolveVoQNamespace(voqMaps.oidToNamespace, oid, activeNamespaces)
 			if !ok {
 				log.V(2).Infof("Skipping VoQ %v: no active namespace owns OID %v", voqName, oid)
 				continue
