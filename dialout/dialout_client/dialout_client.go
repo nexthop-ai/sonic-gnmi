@@ -53,6 +53,16 @@ func (r reportType) String() string {
 	return typeString[r]
 }
 
+// receiveErrorBackoff is the pause after a CONFIG_DB receive error that is
+// not a timeout.
+const receiveErrorBackoff = 100 * time.Millisecond
+
+var (
+	// globalDefaults is the configuration the current run started with,
+	// which a Global field falls back to when it is removed.
+	globalDefaults ClientConfig
+)
+
 var (
 	typeString = map[reportType]string{
 		Unknown:  "unknown",
@@ -201,8 +211,14 @@ func (cs *clientSubscription) NewInstance(ctx context.Context) error {
 		dc, err = sdc.NewDbClient(cs.paths, cs.prefix)
 	}
 	if err != nil {
+<<<<<<< HEAD
 		log.V(1).Infof("Connection to DB for %v failed: %v", *cs, err)
 		return fmt.Errorf("Connection to DB for %v failed: %v", *cs, err)
+=======
+		log.V(1).Infof("%v", err)
+		cs.retryLater(ctx)
+		return err
+>>>>>>> 29069e0 (NOS-23564: [dialout_client] Pace failed reads, sends and dials, and let every wait end on cancel (#401))
 	}
 	cs.dc = dc
 	go publishRun(ctx, cs, dests)
@@ -210,6 +226,92 @@ func (cs *clientSubscription) NewInstance(ctx context.Context) error {
 	return nil
 }
 
+<<<<<<< HEAD
+=======
+// retryLater builds the instance again after RetryInterval when its data
+// source could not be opened. Some of those errors clear on their own (a
+// database that does not answer yet at boot); others, such as a mistyped
+// target, last until the entry is edited, and are retried at the same pace,
+// with the reason in the log. It gives up once the entry has been replaced or
+// removed, or the instance cancelled.
+func (cs *clientSubscription) retryLater(ctx context.Context) {
+	time.AfterFunc(cs.cfg.RetryInterval, func() {
+		configMu.Lock()
+		defer configMu.Unlock()
+		if ctx.Err() == nil && ClientSubscriptionNameMap[cs.name] == cs {
+			cs.NewInstance(ctx, cs.cfg)
+		}
+	})
+}
+
+// serving reports whether the instance runs, as opposed to waiting for its
+// destination group or its data source. dc is set only where NewInstance
+// starts publishRun. Every teardown replaces or removes the entry: a group
+// delete re-registers its subscriptions as copies that wait for the group.
+// So for the entry in ClientSubscriptionNameMap a set dc means a running
+// instance.
+func (cs *clientSubscription) serving() bool {
+	cs.cMu.Lock()
+	defer cs.cMu.Unlock()
+	return cs.dc != nil
+}
+
+// openSource opens the entry's data source and, for a stream to OC_YANG or
+// OTHERS, sets the subscription list its StreamRun is given.
+func (cs *clientSubscription) openSource(ctx context.Context) (sdc.Client, error) {
+	target := cs.prefix.GetTarget()
+	if target == "" {
+		return nil, fmt.Errorf("Empty target data not supported yet")
+	}
+	// The data client may rewrite the paths it is given (module prefixes,
+	// wildcard keys), and an instance re-created on a group or Global edit
+	// opens its source from the entry's paths again, so it gets a copy.
+	paths := clonePaths(cs.paths)
+	var dc sdc.Client
+	var err error
+	if target == "OTHERS" {
+		dc, err = sdc.NewNonDbClient(paths, cs.prefix)
+		cs.subList = streamList(cs.prefix, paths, gpb.SubscriptionMode_SAMPLE, cs.interval, cs.cfg.Encoding)
+	} else if target == "OC_YANG" {
+		dc, err = sdc.NewTranslClient(cs.prefix, paths, ctx, nil, sdc.TranslWildcardOption{})
+		cs.subList = streamList(cs.prefix, paths, gpb.SubscriptionMode_TARGET_DEFINED, 0, cs.cfg.Encoding)
+	} else {
+		dc, err = sdc.NewDbClient(paths, cs.prefix)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the data source for target %s: %v", target, err)
+	}
+	return dc, nil
+}
+
+// clonePaths copies paths deeply.
+func clonePaths(paths []*gpb.Path) []*gpb.Path {
+	out := make([]*gpb.Path, len(paths))
+	for i, p := range paths {
+		out[i] = proto.Clone(p).(*gpb.Path)
+	}
+	return out
+}
+
+// streamList is the subscription list a stream passes to its data client,
+// as a dial-in Subscribe would: every path in the given mode, sampled every
+// interval (0 leaves the interval to the target). The paths must be the
+// ones the data client was built with, since it looks them up by pointer.
+func streamList(prefix *gpb.Path, paths []*gpb.Path, mode gpb.SubscriptionMode, interval time.Duration, enc gpb.Encoding) *gpb.SubscriptionList {
+	subs := make([]*gpb.Subscription, len(paths))
+	for i, p := range paths {
+		subs[i] = &gpb.Subscription{Path: p, Mode: mode, SampleInterval: uint64(interval)}
+	}
+	return &gpb.SubscriptionList{Prefix: prefix, Subscription: subs, Mode: gpb.SubscriptionList_STREAM, Encoding: enc}
+}
+
+// refusedError is a stream ended by the data client refusing the entry's
+// subscription list. A retry would be refused the same way.
+type refusedError struct{ msg string }
+
+func (e refusedError) Error() string { return e.msg }
+
+>>>>>>> 29069e0 (NOS-23564: [dialout_client] Pace failed reads, sends and dials, and let every wait end on cancel (#401))
 // send runs until process Queue returns an error.
 func (cs *clientSubscription) send(stream spb.GNMIDialOut_PublishClient) error {
 	for {
@@ -286,6 +388,39 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+<<<<<<< HEAD
+=======
+// maxRetryIntervalSecs is the largest retry_interval this client accepts,
+// and maxReportIntervalMs the largest report_interval; a larger value is
+// refused. They follow the 1*4DIGIT and 1*8DIGIT rules below.
+const (
+	maxRetryIntervalSecs = 9999
+	maxReportIntervalMs  = 99999999
+)
+
+// dialCollector dials a destination; a variable so a test can land a
+// cancel between a dial that succeeded and the check that follows it.
+var dialCollector = newClient
+
+// pauseBeforeRetry waits RetryInterval before the next attempt, or until
+// the instance is cancelled.
+func pauseBeforeRetry(ctx context.Context, cs *clientSubscription) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(cs.cfg.RetryInterval):
+	}
+}
+
+// waitInterval waits the report interval, or until the instance stops.
+func waitInterval(ctx context.Context, cs *clientSubscription) {
+	select {
+	case <-ctx.Done():
+	case <-cs.stop:
+	case <-time.After(cs.interval):
+	}
+}
+
+>>>>>>> 29069e0 (NOS-23564: [dialout_client] Pace failed reads, sends and dials, and let every wait end on cancel (#401))
 func publishRun(ctx context.Context, cs *clientSubscription, dests []Destination) {
 	var err error
 	var c *Client
@@ -294,6 +429,11 @@ func publishRun(ctx context.Context, cs *clientSubscription, dests []Destination
 	destIdx = 0
 
 restart: //Remote server might go down, in that case we restart with next destination in the group
+	// A cancelled instance makes no further attempt.
+	if ctx.Err() != nil {
+		cs.Close()
+		return
+	}
 	cs.cMu.Lock()
 	cs.stop = make(chan struct{}, 1)
 	cs.q = queue.NewPriorityQueue(1, false)
@@ -323,6 +463,7 @@ restart: //Remote server might go down, in that case we restart with next destin
 		log.V(1).Infof("Publish to %v for %v failed: %v, retrying", dest, cs.name, err)
 		c.Close()
 		cs.Close()
+		pauseBeforeRetry(ctx, cs)
 		goto restart
 	}
 
@@ -339,15 +480,21 @@ restart: //Remote server might go down, in that case we restart with next destin
 
 	switch cs.reportType {
 	case Periodic:
+		sessionStart := time.Now()
 		for {
 			select {
 			default:
 				spbValues, err := cs.dc.Get(nil)
 				if err != nil {
-					// TODO: need to inform
+					// Wait out the interval before reading again: a source
+					// that stays down must not be read in a busy loop.
 					log.V(2).Infof("Data read error %v for %v", err, cs)
+					waitInterval(ctx, cs)
+					if ctx.Err() != nil {
+						cs.Close()
+						return
+					}
 					continue
-					//return nil, status.Error(codes.NotFound, err.Error())
 				}
 				var updates []*gpb.Update
 				var spbValue *spb.Value
@@ -372,14 +519,18 @@ restart: //Remote server might go down, in that case we restart with next destin
 				if err != nil {
 					log.V(1).Infof("Client %v pub Send error:%v, cs.conTryCnt %v", cs.name, err, cs.conTryCnt)
 					cs.Close()
-					// Retry
+					// As for a stream: only a session that died early
+					// pauses, so failover after a long one is immediate.
+					if time.Since(sessionStart) < cs.cfg.RetryInterval {
+						pauseBeforeRetry(ctx, cs)
+					}
 					goto restart
 				}
 				log.V(6).Infof("cs %s to  %s done", cs.name, dest)
 				cs.sendMsg++
 				c.sendMsg++
 
-				time.Sleep(cs.interval)
+				waitInterval(ctx, cs)
 			case <-cs.stop:
 				log.V(1).Infof("%v exiting publishRun routine for destination %s", cs, dest)
 				return
@@ -397,8 +548,24 @@ restart: //Remote server might go down, in that case we restart with next destin
 			}
 			cs.Close()
 			cs.w.Wait()
+<<<<<<< HEAD
 			// Don't restart immediatly
 			time.Sleep(clientCfg.RetryInterval)
+=======
+			if refused := (refusedError{}); errors.As(err, &refused) {
+				// Not retried: an edit of the row or of its destination
+				// group starts a new instance.
+				log.Errorf("Subscription %v stopped, the data source refused it: %v", cs.name, err)
+				return
+			}
+			// The blocking dial in newClient already retries for up to
+			// RetryInterval, on gRPC's connect backoff, so only a session that died
+			// early needs a pause, to keep a collector that accepts and closes from
+			// causing a tight loop.
+			if time.Since(started) < cs.cfg.RetryInterval {
+				pauseBeforeRetry(ctx, cs)
+			}
+>>>>>>> 29069e0 (NOS-23564: [dialout_client] Pace failed reads, sends and dials, and let every wait end on cancel (#401))
 			goto restart
 
 		case <-cs.stop:
@@ -445,9 +612,25 @@ func closeDestGroupClient(destGroupName string) {
 	if names, ok := DestGrp2ClientSubMap[destGroupName]; ok {
 		for _, name := range names {
 			cs := ClientSubscriptionNameMap[name]
+<<<<<<< HEAD
 			cs.Close()
 			cs.cancel()
+=======
+			if cs == nil {
+				continue
+			}
+			closeInstance(cs)
+>>>>>>> 29069e0 (NOS-23564: [dialout_client] Pace failed reads, sends and dials, and let every wait end on cancel (#401))
 		}
+	}
+}
+
+// closeInstance is every teardown of a live instance: it closes the
+// instance and cancels its context, if it has one.
+func closeInstance(cs *clientSubscription) {
+	cs.Close()
+	if cs.cancel != nil {
+		cs.cancel()
 	}
 }
 
@@ -480,6 +663,24 @@ func matchRowPrefix(key string, rowType string, separator string) (string, bool)
 	return "", false
 }
 
+<<<<<<< HEAD
+=======
+// rowUpdated reports whether a delete event left fields under the key. A
+// keyspace hdel also fires when one field of a row is removed; the row is
+// gone only when nothing is left.
+func rowUpdated(op string, fv map[string]string) bool {
+	return op == "hdel" && len(fv) > 0
+}
+
+// applyTelemetryClientConfig applies one TELEMETRY_CLIENT row change. A
+// refused row is never retried, so the V(1) line here is the only trace of it.
+func applyTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, key string, op string) {
+	if err := processTelemetryClientConfig(ctx, redisDb, key, op); err != nil {
+		log.V(1).Infof("TELEMETRY_CLIENT %v %v refused: %v", key, op, err)
+	}
+}
+
+>>>>>>> 29069e0 (NOS-23564: [dialout_client] Pace failed reads, sends and dials, and let every wait end on cancel (#401))
 // start/stop/update telemetry publist client as requested
 // TODO: more validation on db data
 func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, key string, op string) error {
@@ -545,6 +746,7 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 				return fmt.Errorf("%v is being used: %v", destGroupName, DestGrp2ClientSubMap)
 			}
 			delete(destGrpNameMap, destGroupName)
+			setupDestGroupClients(ctx, destGroupName)
 			log.V(3).Infof("Deleted  DestinationGroup %v", destGroupName)
 			return nil
 		} else {
@@ -574,6 +776,7 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 			return fmt.Errorf("Empty Subscription name %v", key)
 		}
 		csub, ok := ClientSubscriptionNameMap[name]
+<<<<<<< HEAD
 		if ok {
 			csub.Close()
 			csub.cancel()
@@ -592,6 +795,20 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 			DestGrp2ClientSubMap[destGrpName] = csNames
 			// Delete clientSubscription from name map
 			delete(ClientSubscriptionNameMap, name)
+=======
+		if rowUpdated(op, fv) {
+			op = "hset"
+		}
+		if op == "hdel" {
+			if !ok {
+				// A row that was refused or has no dst_group is not
+				// registered: there is nothing to stop.
+				log.V(2).Infof("Subscription %v is not registered, nothing to delete", name)
+				return nil
+			}
+			closeInstance(csub)
+			unregisterSubscription(csub)
+>>>>>>> 29069e0 (NOS-23564: [dialout_client] Pace failed reads, sends and dials, and let every wait end on cancel (#401))
 			log.V(3).Infof("Deleted  Client Subscription %v", name)
 			return nil
 		} else {
@@ -638,6 +855,15 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 				}
 			}
 			log.V(2).Infof("New clientSubscription %v", cs)
+<<<<<<< HEAD
+=======
+			if ok {
+				// The old instance leaves its group's user list too: the
+				// row may name another group now, or none.
+				closeInstance(csub)
+				unregisterSubscription(csub)
+			}
+>>>>>>> 29069e0 (NOS-23564: [dialout_client] Pace failed reads, sends and dials, and let every wait end on cancel (#401))
 			if cs.destGroupName == "" {
 				// not destination configured, just return
 				return nil
@@ -662,9 +888,33 @@ func processTelemetryClientConfig(ctx context.Context, redisDb *redis.Client, ke
 	return nil
 }
 
+// resetClientSubscriptions stops every running instance and empties the
+// configuration tables.
+func resetClientSubscriptions() {
+	configMu.Lock()
+	defer configMu.Unlock()
+	resetLocked()
+}
+
+// resetLocked is resetClientSubscriptions with configMu held.
+func resetLocked() {
+	for name, cs := range ClientSubscriptionNameMap {
+		if cs == nil {
+			continue
+		}
+		closeInstance(cs)
+		delete(ClientSubscriptionNameMap, name)
+	}
+	DestGrp2ClientSubMap = map[string][]string{}
+	destGrpNameMap = map[string][]Destination{}
+}
+
 // read configDB data for telemetry client and start publishing service for client subscription
 func DialOutRun(ctx context.Context, ccfg *ClientConfig) error {
+<<<<<<< HEAD
 	clientCfg = ccfg
+=======
+>>>>>>> 29069e0 (NOS-23564: [dialout_client] Pace failed reads, sends and dials, and let every wait end on cancel (#401))
 	ns, _ := sdcfg.GetDbDefaultNamespace()
 	dbn, err := sdcfg.GetDbId("CONFIG_DB", ns)
 	if err != nil {
@@ -704,6 +954,18 @@ func DialOutRun(ctx context.Context, ccfg *ClientConfig) error {
 	if err != nil {
 		return err
 	}
+	// A run starts from an empty table and replays CONFIG_DB below; when
+	// it ends, every instance it started is stopped and the table emptied,
+	// so a later run (or a test) does not inherit entries.
+	configMu.Lock()
+	if ccfg.RetryInterval <= 0 {
+		ccfg.RetryInterval = time.Second // 0 would retry a failed dial with no pause
+	}
+	clientCfg = ccfg
+	globalDefaults = *ccfg
+	resetLocked()
+	configMu.Unlock()
+	defer resetClientSubscriptions()
 	pattern := "__keyspace@" + strconv.Itoa(int(dbn)) + "__:TELEMETRY_CLIENT" + separator
 	prefixLen := len(pattern)
 	pattern += "*"
@@ -736,18 +998,10 @@ func DialOutRun(ctx context.Context, ccfg *ClientConfig) error {
 	}
 
 	for {
-		msgi, err := pubsub.ReceiveTimeout(context.Background(), time.Millisecond*1000)
+		subscr, err := nextConfigEvent(ctx, pubsub)
 		if err != nil {
-			neterr, ok := err.(net.Error)
-			if ok {
-				if neterr.Timeout() == true {
-					continue
-				}
-			}
-			log.V(2).Infof("pubsub.ReceiveTimeout err %v", err)
-			continue
+			return err
 		}
-		subscr := msgi.(*redis.Message)
 		dbkey := subscr.Channel[prefixLen:]
 		if subscr.Payload == "del" || subscr.Payload == "hdel" {
 			processTelemetryClientConfig(ctx, redisDb, dbkey, "hdel")
@@ -762,6 +1016,44 @@ func DialOutRun(ctx context.Context, ccfg *ClientConfig) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+	}
+}
+
+// configReceiver is the CONFIG_DB keyspace subscription as nextConfigEvent
+// uses it; a *redis.PubSub, or a stand-in in a test.
+type configReceiver interface {
+	ReceiveTimeout(ctx context.Context, timeout time.Duration) (interface{}, error)
+}
+
+// nextConfigEvent waits for the next CONFIG_DB keyspace message, or returns
+// ctx's error once ctx is done. An error other than a timeout is retried
+// after receiveErrorBackoff, never in a spin. Keyspace events are not
+// queued: a row written while the subscription was down is applied when it
+// is next written.
+func nextConfigEvent(ctx context.Context, pubsub configReceiver) (*redis.Message, error) {
+	for {
+		msgi, err := pubsub.ReceiveTimeout(context.Background(), time.Millisecond*1000)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+				continue
+			}
+			log.V(2).Infof("pubsub.ReceiveTimeout err %v", err)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(receiveErrorBackoff):
+			}
+			continue
+		}
+		switch msg := msgi.(type) {
+		case *redis.Message:
+			return msg, nil
+		case *redis.Subscription:
+			log.V(1).Infof("CONFIG_DB subscription to %v set up again; rows written meanwhile are not applied until written again", msg.Channel)
 		}
 	}
 }
