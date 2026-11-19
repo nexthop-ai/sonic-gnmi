@@ -46,6 +46,28 @@ type Client struct {
 	w        sync.WaitGroup
 	fatal    bool
 	logLevel int
+<<<<<<< HEAD
+=======
+	// closing is closed when Close starts, before it takes mu; a recv
+	// blocked on polled sees it and lets go of mu so Close can proceed.
+	closing     chan struct{}
+	closingOnce sync.Once
+	// state is what this stream subscribed to, recorded from its first
+	// request. Its STATE_DB row is built from it (subscription_state.go).
+	// One Client is one Subscribe stream; a collector with several streams
+	// has several Clients.
+	state *subscriptionInfo
+	// statePub is the publisher of the server that created this Client, or nil
+	// when that server could not open one. Set before Run and not changed
+	// after.
+	statePub *statePublisher
+	// Byte counters the gRPC stats handler keeps for this stream; the
+	// publisher reads them on each tick for the row's byte counts.
+	bytes *substate.RPCBytes
+	// Why the stream ended, or why it was turned away before it ran.
+	endCause    string
+	rejectCause string
+>>>>>>> 43406f9 (NOS-23423: [gnmi_server] Do not send a Poll request on a polled channel that Close has closed (#403))
 }
 
 // Syslog level for error
@@ -70,6 +92,7 @@ func NewClient(addr net.Addr) *Client {
 		addr:     addr,
 		id:       atomic.AddUint64(&clientIDCounter, 1),
 		q:        pq,
+		closing:  make(chan struct{}),
 		logLevel: logLevelError,
 	}
 }
@@ -287,10 +310,36 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 	return nil
 }
 
+// requestPoll hands one Poll request to the data client, and reports false
+// once the client is closing. Close closes polled under mu, so the send
+// holds mu for reading and also waits on closing: a send on a closed
+// channel would panic, and a send that blocked while Close waited for mu
+// would never return if the data client had stopped reading polled.
+func (c *Client) requestPoll() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	select {
+	case <-c.closing:
+		return false
+	default:
+	}
+	select {
+	case c.polled <- struct{}{}:
+		return true
+	case <-c.closing:
+		return false
+	}
+}
+
 // Closing of client queue is triggered upon end of stream receive or stream error
 // or fatal error of any client go routine .
 // it will cause cancle of client context and exit of the send goroutines.
 func (c *Client) Close() {
+	c.closingOnce.Do(func() {
+		if c.closing != nil {
+			close(c.closing)
+		}
+	})
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	log.V(1).Infof("Client %s Close, sendMsg %v recvMsg %v errors %v", c,
@@ -319,6 +368,7 @@ func (c *Client) Close() {
 	}
 }
 
+<<<<<<< HEAD
 // signalPoll registers the sender while holding c.mu so Close cannot close
 // the poll channel concurrently. A blocked send is canceled by Close.
 func (c *Client) signalPoll() bool {
@@ -326,6 +376,22 @@ func (c *Client) signalPoll() bool {
 	if c.closed || c.polled == nil {
 		c.mu.RUnlock()
 		return false
+=======
+// Abort() enqueues a Fatal message to the subscribed client's queue
+// (if not already disposed). This will cause c.send() to exit out
+// and proceed with client connection teardown.
+//
+// If calling to abort subscribe RPCs in preparation for a config reload,
+// pass in `ConfigReloadRequested` as the argument.
+func (c *Client) Abort(reason string) {
+	// A read lock keeps Close out, and does not wait behind a recv that is
+	// blocked in requestPoll.
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.q == nil || c.q.Disposed() {
+		return
+>>>>>>> 43406f9 (NOS-23423: [gnmi_server] Do not send a Poll request on a polled channel that Close has closed (#403))
 	}
 	poll := c.polled
 	pollStop := c.pollStop
@@ -373,7 +439,11 @@ func (c *Client) recv(stream gnmipb.GNMI_SubscribeServer) {
 			if _, ok := event.Request.(*gnmipb.SubscribeRequest_Poll); !ok {
 				return
 			}
+<<<<<<< HEAD
 			if !c.signalPoll() {
+=======
+			if !c.requestPoll() {
+>>>>>>> 43406f9 (NOS-23423: [gnmi_server] Do not send a Poll request on a polled channel that Close has closed (#403))
 				return
 			}
 			continue

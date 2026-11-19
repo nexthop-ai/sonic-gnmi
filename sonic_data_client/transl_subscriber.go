@@ -143,7 +143,14 @@ func (ts *translSubscriber) processResponses(q *queue.PriorityQueue) {
 		case *translib.SubscribeResponse:
 
 			if v.IsTerminated {
+<<<<<<< HEAD
 				//DB Connection or other backend error
+=======
+				// DB connection or other backend error. Only ON_CHANGE gets
+				// here: translib sets IsTerminated from its DB notification
+				// handler only. The Fatal ends the stream. c.channel was
+				// handed in and is not this routine's to close.
+>>>>>>> 43406f9 (NOS-23423: [gnmi_server] Do not send a Poll request on a polled channel that Close has closed (#403))
 				enqueFatalMsgTranslib(c, "DB Connection Error")
 				close(c.channel)
 				return
